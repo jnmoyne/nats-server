@@ -9680,6 +9680,152 @@ func TestJetStreamSourceBasics(t *testing.T) {
 	})
 }
 
+func TestJetStreamSourceMultiples(t *testing.T) {
+	var streamName = "test"
+
+	publish := func(ctx context.Context, js jetstream.JetStream, subject string) {
+		for i := 0; i < 10; i++ {
+			fmt.Printf(subject+".%d\n", i)
+			_, err := js.Publish(ctx, fmt.Sprintf(subject+".%d", i), []byte("payload"))
+			require_NoError(t, err)
+		}
+	}
+
+	s := RunBasicJetStreamServer(t)
+	defer s.Shutdown()
+
+	nc, err := nats.Connect(s.ClientURL())
+	require_NoError(t, err)
+
+	ctx := context.Background()
+	js, err := jetstream.New(nc)
+	require_NoError(t, err)
+
+	_, err = js.CreateStream(ctx, jetstream.StreamConfig{
+		Name:     streamName,
+		Subjects: []string{"foo.*", "bar.*", "bad.*", "1.*", "2.*", "3.*"},
+	})
+	require_NoError(t, err)
+
+	time.Sleep(100 * time.Millisecond)
+
+	publish(ctx, js, "foo")
+	publish(ctx, js, "bad")
+	publish(ctx, js, "bar")
+	publish(ctx, js, "1")
+	publish(ctx, js, "2")
+	publish(ctx, js, "3")
+
+	sources := make([]*jetstream.StreamSource, 5)
+	sources[0] = &jetstream.StreamSource{
+		Name:          streamName,
+		OptStartSeq:   0,
+		OptStartTime:  nil,
+		FilterSubject: "",
+		SubjectTransforms: []jetstream.SubjectTransformConfig{
+			{
+				Source:      "foo.*",
+				Destination: "newfoo.{{wildcard(1)}}",
+			},
+		},
+	}
+	sources[1] = &jetstream.StreamSource{
+		Name:          streamName,
+		OptStartSeq:   0,
+		OptStartTime:  nil,
+		FilterSubject: "",
+		SubjectTransforms: []jetstream.SubjectTransformConfig{
+			{
+				Source:      "1.*",
+				Destination: "new1.{{wildcard(1)}}",
+			},
+		},
+	}
+	sources[2] = &jetstream.StreamSource{
+		Name:          streamName,
+		OptStartSeq:   0,
+		OptStartTime:  nil,
+		FilterSubject: "",
+		SubjectTransforms: []jetstream.SubjectTransformConfig{
+			{
+				Source:      "2.*",
+				Destination: "new2.{{wildcard(1)}}",
+			},
+		},
+	}
+	sources[3] = &jetstream.StreamSource{
+		Name:          streamName,
+		OptStartSeq:   0,
+		OptStartTime:  nil,
+		FilterSubject: "",
+		SubjectTransforms: []jetstream.SubjectTransformConfig{
+			{
+				Source:      "3.*",
+				Destination: "new3.{{wildcard(1)}}",
+			},
+		},
+	}
+	sources[4] = &jetstream.StreamSource{
+		Name:          streamName,
+		OptStartSeq:   0,
+		OptStartTime:  nil,
+		FilterSubject: "",
+		SubjectTransforms: []jetstream.SubjectTransformConfig{
+			{
+				Source:      "bar.*",
+				Destination: "newbar.{{wildcard(1)}}",
+			},
+		},
+	}
+
+	// create the consumer group's stream
+	stream, err := js.CreateStream(ctx, jetstream.StreamConfig{
+		Name:        "sourcing",
+		Retention:   jetstream.WorkQueuePolicy,
+		Replicas:    1,
+		Storage:     jetstream.FileStorage,
+		Discard:     jetstream.DiscardNew,
+		Sources:     sources,
+		AllowDirect: true,
+	})
+	require_NoError(t, err)
+
+	consumer, err := stream.CreateConsumer(ctx, jetstream.ConsumerConfig{
+		Name:      "consumer",
+		AckPolicy: jetstream.AckExplicitPolicy,
+	})
+	require_NoError(t, err)
+
+	var received atomic.Int32
+	received.Store(0)
+
+	consumer.Consume(func(msg jetstream.Msg) {
+		fmt.Printf("Got message on: %s\n", msg.Subject())
+		received.Add(1)
+		msg.Ack()
+	})
+
+	now := time.Now()
+	for {
+		time.Sleep(100 * time.Millisecond)
+		//si, err := stream.Info(ctx)
+		//require_NoError(t, err)
+		//fmt.Printf("Msgs=%d\n", si.State.Msgs)
+		//if si.State.Msgs == 50 {
+		//	break
+		//}
+
+		fmt.Printf("received=%d\n", received.Load())
+		if received.Load() == 50 {
+			break
+		}
+
+		if time.Since(now) > 6*time.Second {
+			t.Fatalf("timeout")
+		}
+	}
+}
+
 func TestJetStreamSourceWorkingQueueWithLimit(t *testing.T) {
 	s := RunBasicJetStreamServer(t)
 	defer s.Shutdown()

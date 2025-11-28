@@ -3503,6 +3503,7 @@ func (mset *stream) setupSourceConsumer(iname string, seq uint64, startTime time
 // Lock should be held.
 func (mset *stream) trySetupSourceConsumer(iname string, seq uint64, startTime time.Time) {
 	// Ignore if closed or not leader.
+	fmt.Printf("trySetupSourceConsumer called for %s, seq=%d, time=%v\n", iname, seq, startTime)
 	if mset.closed.Load() || !mset.isLeader() {
 		return
 	}
@@ -3565,7 +3566,9 @@ func (mset *stream) trySetupSourceConsumer(iname string, seq uint64, startTime t
 					req.Config.OptStartTime = ssi.OptStartTime
 				}
 				req.Config.DeliverPolicy = DeliverByStartTime
-			} else if state.FirstSeq > 1 && !state.LastTime.IsZero() {
+			} else if seq > 1 && state.FirstSeq > 1 && !state.LastTime.IsZero() { // correct
+				//} else if state.FirstSeq > 1 && !state.LastTime.IsZero() { // this makes a false assumption for sources that the stream has already messages in it means we have already sourced messages (false because it can have already a message from another source)
+				fmt.Printf("B: first seq=%d\n", state.FirstSeq)
 				req.Config.OptStartTime = &state.LastTime
 				req.Config.DeliverPolicy = DeliverByStartTime
 			}
@@ -3575,6 +3578,8 @@ func (mset *stream) trySetupSourceConsumer(iname string, seq uint64, startTime t
 		req.Config.OptStartSeq = seq
 		req.Config.DeliverPolicy = DeliverByStartSequence
 	}
+
+	fmt.Printf("trySetupSourceConsumer req=%v\n", req)
 	// Filters
 	if ssi.FilterSubject != _EMPTY_ {
 		req.Config.FilterSubject = ssi.FilterSubject
