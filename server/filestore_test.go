@@ -16915,3 +16915,306 @@ func TestFileStoreCompactionPreservesRedelivery(t *testing.T) {
 		return nil
 	})
 }
+
+func TestFileStoreConsumerEncodeDecodeDeferred(t *testing.T) {
+	state := &ConsumerState{}
+	state.Delivered.Consumer = 100
+	state.Delivered.Stream = 100
+	state.AckFloor.Consumer = 50
+	state.AckFloor.Stream = 50
+
+	// Without deferred sequences the encoding stays at version 2.
+	buf := encodeConsumerState(state)
+	require_Equal(t, buf[1], 2)
+	rstate, err := decodeConsumerState(buf)
+	require_NoError(t, err)
+	require_True(t, reflect.DeepEqual(state, rstate))
+
+	// Deferred alone, with pending and with redelivered, all use version 3 and round trip.
+	ago := time.Now().Add(-30 * time.Second).Truncate(time.Second)
+	nt := func(dseq uint64) *Pending {
+		ago = ago.Add(time.Second)
+		return &Pending{dseq, ago.UnixNano()}
+	}
+	for _, s := range []*ConsumerState{
+		{Delivered: SequencePair{100, 100}, AckFloor: SequencePair{50, 50},
+			Deferred: map[uint64]struct{}{51: {}, 77: {}, 100: {}}},
+		{Delivered: SequencePair{100, 100}, AckFloor: SequencePair{50, 50},
+			Pending:  map[uint64]*Pending{60: nt(51), 55: nt(52), 90: nt(53)},
+			Deferred: map[uint64]struct{}{51: {}, 77: {}}},
+		{Delivered: SequencePair{100, 100}, AckFloor: SequencePair{50, 50},
+			Pending:     map[uint64]*Pending{60: nt(51), 55: nt(52)},
+			Redelivered: map[uint64]uint64{60: 2},
+			Deferred:    map[uint64]struct{}{99: {}}},
+	} {
+		buf := encodeConsumerState(s)
+		require_Equal(t, buf[1], 3)
+		rstate, err := decodeConsumerState(buf)
+		require_NoError(t, err)
+		require_True(t, reflect.DeepEqual(s, rstate))
+	}
+
+	// A truncated deferred section is corruption.
+	buf = encodeConsumerState(&ConsumerState{Delivered: SequencePair{100, 100}, AckFloor: SequencePair{50, 50},
+		Deferred: map[uint64]struct{}{51: {}, 77: {}}})
+	_, err = decodeConsumerState(buf[:len(buf)-1])
+	require_Error(t, err, errCorruptState)
+}
+
+// testConsumerStoreDeferred exercises the deferred set and the exact ack floors of a consumer store.
+// newStore returns a fresh consumer store for the given config.
+func testConsumerStoreDeferred(t *testing.T, newStore func(t *testing.T, cfg *ConsumerConfig) ConsumerStore) {
+	t.Helper()
+	cfg := func() *ConsumerConfig {
+		return &ConsumerConfig{
+			AckPolicy:                     AckExplicit,
+			MaxAckPendingPerSubjectTokens: []MaxAckPendingPerSubjectTokens{{Filter: "foo.*", Wildcards: []int{1}, MaxAckPending: 1}},
+		}
+	}
+	ts := time.Now().Truncate(time.Second).UnixNano()
+
+	// Checks the state invariants and that the encoded state decodes to the same state.
+	checkState := func(t *testing.T, o ConsumerStore) *ConsumerState {
+		t.Helper()
+		state, err := o.State()
+		require_NoError(t, err)
+		for seq, p := range state.Pending {
+			require_True(t, state.AckFloor.Stream < seq)
+			require_True(t, state.AckFloor.Consumer < p.Sequence)
+			require_True(t, seq <= state.Delivered.Stream)
+			_, deferred := state.Deferred[seq]
+			require_False(t, deferred)
+		}
+		for seq := range state.Deferred {
+			require_True(t, state.AckFloor.Stream < seq)
+			require_True(t, seq <= state.Delivered.Stream)
+		}
+		require_True(t, state.AckFloor.Stream <= state.Delivered.Stream)
+		require_True(t, state.AckFloor.Consumer <= state.Delivered.Consumer)
+		buf, err := o.EncodedState()
+		require_NoError(t, err)
+		rstate, err := decodeConsumerState(buf)
+		require_NoError(t, err)
+		// The encoding can not represent a redelivered entry exactly at the stream ack floor,
+		// it is dropped on decode. That is pre-existing and they are cleaned up separately.
+		expected := *state
+		expected.Redelivered = nil
+		for seq, dc := range state.Redelivered {
+			if seq != state.AckFloor.Stream {
+				if expected.Redelivered == nil {
+					expected.Redelivered = make(map[uint64]uint64)
+				}
+				expected.Redelivered[seq] = dc
+			}
+		}
+		decoded := *rstate
+		if len(decoded.Redelivered) == 0 {
+			decoded.Redelivered = nil
+		}
+		if !reflect.DeepEqual(&expected, &decoded) {
+			t.Fatalf("Decoded state does not match:\n%+v\n%+v", &expected, &decoded)
+		}
+		if len(state.Deferred) > 0 {
+			require_Equal(t, buf[1], 3)
+		} else {
+			require_Equal(t, buf[1], 2)
+		}
+		return state
+	}
+	deferredSet := func(seqs ...uint64) map[uint64]struct{} {
+		if len(seqs) == 0 {
+			return nil
+		}
+		m := make(map[uint64]struct{}, len(seqs))
+		for _, seq := range seqs {
+			m[seq] = struct{}{}
+		}
+		return m
+	}
+
+	t.Run("deferred lifecycle", func(t *testing.T) {
+		o := newStore(t, cfg())
+		require_False(t, o.HasState())
+
+		// Deferring records the sequences and moves delivered past them.
+		require_NoError(t, o.UpdateDeferred([]uint64{1, 2}))
+		require_True(t, o.HasState())
+		state := checkState(t, o)
+		require_Equal(t, state.Delivered, SequencePair{Consumer: 0, Stream: 2})
+		require_Equal(t, state.AckFloor, SequencePair{})
+		require_True(t, reflect.DeepEqual(state.Deferred, deferredSet(1, 2)))
+
+		// Update with our own state round trips.
+		require_NoError(t, o.Update(state))
+		state2 := checkState(t, o)
+		require_True(t, reflect.DeepEqual(state, state2))
+
+		// Update rejects a deferred sequence that is out of range or also pending.
+		bad := &ConsumerState{Delivered: SequencePair{2, 4}, AckFloor: SequencePair{1, 2}, Deferred: deferredSet(2)}
+		require_Error(t, o.Update(bad))
+		bad = &ConsumerState{Delivered: SequencePair{2, 4}, AckFloor: SequencePair{1, 2}, Deferred: deferredSet(5)}
+		require_Error(t, o.Update(bad))
+		bad = &ConsumerState{Delivered: SequencePair{2, 4}, AckFloor: SequencePair{1, 2},
+			Pending: map[uint64]*Pending{3: {2, ts}}, Deferred: deferredSet(3)}
+		require_Error(t, o.Update(bad))
+
+		// Delivering a deferred message moves it to pending with its new delivery sequence.
+		require_NoError(t, o.UpdateDelivered(1, 1, 1, ts))
+		state = checkState(t, o)
+		require_True(t, reflect.DeepEqual(state.Deferred, deferredSet(2)))
+		require_Equal(t, state.Pending[1].Sequence, 1)
+		require_Equal(t, state.Delivered, SequencePair{Consumer: 1, Stream: 2})
+
+		// Deliver 3 normally.
+		require_NoError(t, o.UpdateDelivered(2, 3, 1, ts))
+		state = checkState(t, o)
+		require_Equal(t, state.Pending[3].Sequence, 2)
+		require_Equal(t, state.Delivered, SequencePair{Consumer: 2, Stream: 3})
+
+		// Ack 3 first, the floors stay below the pending 1 and the deferred 2.
+		require_NoError(t, o.UpdateAcks(2, 3))
+		state = checkState(t, o)
+		require_Equal(t, state.AckFloor, SequencePair{Consumer: 0, Stream: 0})
+		require_Equal(t, len(state.Pending), 1)
+
+		// Ack 1, the floor moves up to just below the deferred 2.
+		require_NoError(t, o.UpdateAcks(1, 1))
+		state = checkState(t, o)
+		require_Equal(t, state.AckFloor, SequencePair{Consumer: 2, Stream: 1})
+		require_Equal(t, len(state.Pending), 0)
+		require_True(t, reflect.DeepEqual(state.Deferred, deferredSet(2)))
+
+		// A stale ack for the deferred sequence must not touch it.
+		require_Error(t, o.UpdateAcks(5, 2), ErrStoreMsgNotFound)
+		state = checkState(t, o)
+		require_True(t, reflect.DeepEqual(state.Deferred, deferredSet(2)))
+
+		// A replay of the deferral of 1 is ignored, the cursor is past it.
+		require_NoError(t, o.UpdateDeferred([]uint64{1}))
+		state = checkState(t, o)
+		require_True(t, reflect.DeepEqual(state.Deferred, deferredSet(2)))
+		require_Equal(t, state.Delivered.Stream, 3)
+
+		// A deferred message that is gone is dropped with a zero delivery sequence.
+		require_NoError(t, o.UpdateAcks(0, 2))
+		state = checkState(t, o)
+		require_Equal(t, len(state.Deferred), 0)
+		require_Equal(t, state.AckFloor, state.Delivered)
+
+		// Once the config has no entries and nothing is outstanding, the state is plain again.
+		require_NoError(t, o.UpdateConfig(&ConsumerConfig{AckPolicy: AckExplicit}))
+		require_NoError(t, o.UpdateDelivered(3, 4, 1, ts))
+		require_NoError(t, o.UpdateAcks(3, 4))
+		state = checkState(t, o)
+		require_Equal(t, state.AckFloor, SequencePair{Consumer: 3, Stream: 4})
+	})
+
+	t.Run("max deliver releases the floor", func(t *testing.T) {
+		c := cfg()
+		c.MaxDeliver = 2
+		o := newStore(t, c)
+		require_NoError(t, o.UpdateDeferred([]uint64{1}))
+		require_NoError(t, o.UpdateDelivered(1, 2, 1, ts))
+		require_NoError(t, o.UpdateDelivered(2, 1, 1, ts))
+		state := checkState(t, o)
+		require_Equal(t, state.AckFloor, SequencePair{})
+		// Redeliver 1 past max deliver, it leaves pending and the floors move.
+		require_NoError(t, o.UpdateDelivered(3, 1, 2, ts))
+		require_NoError(t, o.UpdateDelivered(4, 1, 3, ts))
+		state = checkState(t, o)
+		require_Equal(t, len(state.Pending), 1)
+		require_Equal(t, state.Redelivered[1], 2)
+		require_Equal(t, state.AckFloor, SequencePair{Consumer: 0, Stream: 1})
+		require_NoError(t, o.UpdateAcks(1, 2))
+		state = checkState(t, o)
+		require_Equal(t, state.AckFloor, state.Delivered)
+	})
+
+	// Stream seqs 5 deferred, 6 delivered, 7 deferred, 8 delivered, then 5 delivered and 7 delivered.
+	// Ack them in several orders, the floors must always stay below every outstanding sequence.
+	for _, order := range [][]uint64{{6, 8, 5, 7}, {5, 7, 6, 8}, {8, 7, 6, 5}, {5, 6, 7, 8}} {
+		t.Run(fmt.Sprintf("out of order acks %v", order), func(t *testing.T) {
+			o := newStore(t, cfg())
+			require_NoError(t, o.UpdateDeferred([]uint64{5}))
+			require_NoError(t, o.UpdateDelivered(1, 6, 1, ts))
+			require_NoError(t, o.UpdateDeferred([]uint64{7}))
+			require_NoError(t, o.UpdateDelivered(2, 8, 1, ts))
+			require_NoError(t, o.UpdateDelivered(3, 5, 1, ts))
+			require_NoError(t, o.UpdateDelivered(4, 7, 1, ts))
+			state := checkState(t, o)
+			require_Equal(t, len(state.Pending), 4)
+			require_Equal(t, len(state.Deferred), 0)
+			require_Equal(t, state.Delivered, SequencePair{Consumer: 4, Stream: 8})
+			dseqs := map[uint64]uint64{5: 3, 6: 1, 7: 4, 8: 2}
+			for i, seq := range order {
+				require_NoError(t, o.UpdateAcks(dseqs[seq], seq))
+				state = checkState(t, o)
+				_, ok := state.Pending[seq]
+				require_False(t, ok)
+				require_Equal(t, len(state.Pending), 3-i)
+				// A state written back from the same view is never rejected as old.
+				require_NoError(t, o.Update(state))
+			}
+			require_Equal(t, state.AckFloor, state.Delivered)
+		})
+	}
+
+	// The exact floors survive the config being turned off while pending is out of order.
+	t.Run("out of order pending without config", func(t *testing.T) {
+		o := newStore(t, cfg())
+		require_NoError(t, o.UpdateDeferred([]uint64{5}))
+		require_NoError(t, o.UpdateDelivered(1, 6, 1, ts))
+		require_NoError(t, o.UpdateDelivered(2, 5, 1, ts))
+		require_NoError(t, o.UpdateConfig(&ConsumerConfig{AckPolicy: AckExplicit}))
+		require_NoError(t, o.UpdateAcks(1, 6))
+		state := checkState(t, o)
+		require_Equal(t, state.AckFloor, SequencePair{Consumer: 1, Stream: 4})
+		require_NoError(t, o.UpdateAcks(2, 5))
+		state = checkState(t, o)
+		require_Equal(t, state.AckFloor, state.Delivered)
+	})
+}
+
+func TestFileStoreConsumerDeferred(t *testing.T) {
+	testFileStoreAllPermutations(t, func(t *testing.T, fcfg FileStoreConfig) {
+		fs, err := newFileStoreWithCreated(fcfg, StreamConfig{Name: "zzz", Storage: FileStorage}, time.Now(), prf(&fcfg), nil)
+		require_NoError(t, err)
+		defer fs.Stop()
+
+		var n int
+		testConsumerStoreDeferred(t, func(t *testing.T, cfg *ConsumerConfig) ConsumerStore {
+			n++
+			o, err := fs.ConsumerStore(fmt.Sprintf("o%d", n), time.Time{}, cfg)
+			require_NoError(t, err)
+			return o
+		})
+
+		// The deferred state is persisted and restored, including out of order pending.
+		cfg := &ConsumerConfig{
+			AckPolicy:                     AckExplicit,
+			MaxAckPendingPerSubjectTokens: []MaxAckPendingPerSubjectTokens{{Filter: "foo.*", Wildcards: []int{1}, MaxAckPending: 1}},
+		}
+		ts := time.Now().Truncate(time.Second).UnixNano()
+		o, err := fs.ConsumerStore("restore", time.Time{}, cfg)
+		require_NoError(t, err)
+		require_NoError(t, o.UpdateDeferred([]uint64{5}))
+		require_NoError(t, o.UpdateDelivered(1, 6, 1, ts))
+		require_NoError(t, o.UpdateDeferred([]uint64{7}))
+		require_NoError(t, o.UpdateDelivered(2, 5, 1, ts))
+		state, err := o.State()
+		require_NoError(t, err)
+		require_NoError(t, o.Stop())
+
+		o, err = fs.ConsumerStore("restore", time.Time{}, cfg)
+		require_NoError(t, err)
+		rstate, err := o.State()
+		require_NoError(t, err)
+		require_True(t, reflect.DeepEqual(state, rstate))
+		// The restored store computes exact floors.
+		require_NoError(t, o.UpdateAcks(1, 6))
+		rstate, err = o.State()
+		require_NoError(t, err)
+		require_Equal(t, rstate.AckFloor, SequencePair{Consumer: 1, Stream: 4})
+		require_NoError(t, o.Stop())
+	})
+}

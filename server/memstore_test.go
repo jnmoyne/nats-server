@@ -1941,3 +1941,17 @@ func TestMemStoreSourcesAddedSourceKeepsExistingState(t *testing.T) {
 	// ORIGIN2 is newly seeded and has nothing to recover.
 	require_Equal(t, state[iName2].Seq, 0)
 }
+
+func TestMemStoreConsumerDeferred(t *testing.T) {
+	ms, err := newMemStore(&StreamConfig{Storage: MemoryStorage})
+	require_NoError(t, err)
+	defer ms.Stop()
+
+	var n int
+	testConsumerStoreDeferred(t, func(t *testing.T, cfg *ConsumerConfig) ConsumerStore {
+		n++
+		o, err := ms.ConsumerStore(fmt.Sprintf("o%d", n), time.Time{}, cfg)
+		require_NoError(t, err)
+		return o
+	})
+}

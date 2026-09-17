@@ -2582,6 +2582,7 @@ type consumerMemStore struct {
 	name   string
 	cfg    ConsumerConfig
 	state  ConsumerState
+	idx    *ackIdx // Exact ack floor index, only when needed.
 	closed bool
 }
 
@@ -2596,8 +2597,19 @@ func (ms *memStore) ConsumerStore(name string, _ time.Time, cfg *ConsumerConfig)
 		return nil, fmt.Errorf("bad consumer config")
 	}
 	o := &consumerMemStore{ms: ms, name: name, cfg: *cfg}
+	o.rebuildIdxLocked()
 	ms.AddConsumer(o)
 	return o, nil
+}
+
+// rebuildIdxLocked creates, refreshes or drops the exact ack floor index from the current state.
+// Lock should be held.
+func (o *consumerMemStore) rebuildIdxLocked() {
+	if needAckIdx(&o.cfg, &o.state) {
+		o.idx = newAckIdx(&o.state)
+	} else {
+		o.idx = nil
+	}
 }
 
 func (ms *memStore) AddConsumer(o ConsumerStore) error {
@@ -2779,6 +2791,10 @@ func (o *consumerMemStore) Update(state *ConsumerState) error {
 			redelivered[seq] = dc
 		}
 	}
+	if err := checkDeferredState(state); err != nil {
+		return err
+	}
+	deferred := copyDeferred(state.Deferred)
 
 	// Replace our state.
 	o.mu.Lock()
@@ -2793,6 +2809,8 @@ func (o *consumerMemStore) Update(state *ConsumerState) error {
 	o.state.AckFloor = state.AckFloor
 	o.state.Pending = pending
 	o.state.Redelivered = redelivered
+	o.state.Deferred = deferred
+	o.rebuildIdxLocked()
 
 	return nil
 }
@@ -2824,6 +2842,10 @@ func (o *consumerMemStore) ForceUpdate(state *ConsumerState) error {
 			redelivered[seq] = dc
 		}
 	}
+	if err := checkDeferredState(state); err != nil {
+		return err
+	}
+	deferred := copyDeferred(state.Deferred)
 
 	// Replace our state.
 	o.mu.Lock()
@@ -2833,6 +2855,8 @@ func (o *consumerMemStore) ForceUpdate(state *ConsumerState) error {
 	o.state.AckFloor = state.AckFloor
 	o.state.Pending = pending
 	o.state.Redelivered = redelivered
+	o.state.Deferred = deferred
+	o.rebuildIdxLocked()
 
 	return nil
 }
@@ -2864,6 +2888,7 @@ func (o *consumerMemStore) UpdateStarting(sseq uint64) {
 func (o *consumerMemStore) Reset(sseq uint64) error {
 	o.mu.Lock()
 	o.state = ConsumerState{}
+	o.rebuildIdxLocked()
 	o.mu.Unlock()
 	return o.SetStarting(sseq)
 }
@@ -2897,7 +2922,14 @@ func (o *consumerMemStore) UpdateDelivered(dseq, sseq, dc uint64, ts int64) erro
 		}
 		var p *Pending
 		// Check for an update to a message already delivered.
-		if sseq <= o.state.Delivered.Stream {
+		if _, deferred := o.state.Deferred[sseq]; deferred {
+			// First delivery of a deferred message, it now becomes pending.
+			delete(o.state.Deferred, sseq)
+			o.state.Pending[sseq] = &Pending{dseq, ts}
+			if o.idx != nil && dseq > 0 {
+				o.idx.pdseqs.Insert(dseq)
+			}
+		} else if sseq <= o.state.Delivered.Stream {
 			if p = o.state.Pending[sseq]; p != nil {
 				// Do not update p.Sequence, that should be the original delivery sequence.
 				p.Timestamp = ts
@@ -2905,6 +2937,12 @@ func (o *consumerMemStore) UpdateDelivered(dseq, sseq, dc uint64, ts int64) erro
 		} else {
 			// Add to pending.
 			o.state.Pending[sseq] = &Pending{dseq, ts}
+			if o.idx != nil {
+				o.idx.pseqs.Insert(sseq)
+				if dseq > 0 {
+					o.idx.pdseqs.Insert(dseq)
+				}
+			}
 		}
 		// Update delivered as needed.
 		if dseq > o.state.Delivered.Consumer {
@@ -2917,7 +2955,16 @@ func (o *consumerMemStore) UpdateDelivered(dseq, sseq, dc uint64, ts int64) erro
 		if dc > 1 {
 			if maxdc := uint64(o.cfg.MaxDeliver); maxdc > 0 && dc > maxdc {
 				// Make sure to remove from pending.
-				delete(o.state.Pending, sseq)
+				if pp, ok := o.state.Pending[sseq]; ok {
+					delete(o.state.Pending, sseq)
+					if o.idx != nil {
+						o.idx.pseqs.Delete(sseq)
+						if pp.Sequence > 0 {
+							o.idx.pdseqs.Delete(pp.Sequence)
+						}
+						o.state.AckFloor = o.idx.floors(o.state.Delivered)
+					}
+				}
 			}
 			if o.state.Redelivered == nil {
 				o.state.Redelivered = make(map[uint64]uint64)
@@ -2942,6 +2989,38 @@ func (o *consumerMemStore) UpdateDelivered(dseq, sseq, dc uint64, ts int64) erro
 	return nil
 }
 
+// UpdateDeferred is called whenever the consumer passed over messages because their
+// max ack pending per subject tokens key was at its limit. They are delivered later.
+func (o *consumerMemStore) UpdateDeferred(seqs []uint64) error {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+
+	if o.cfg.AckPolicy == AckNone {
+		return ErrNoAckPolicy
+	}
+	// The config enabling the feature and the replicated deferred state are not
+	// ordered relative to each other, so make sure we have our index.
+	if o.idx == nil {
+		o.idx = newAckIdx(&o.state)
+	}
+	for _, seq := range seqs {
+		// On restarts we can get a replay from the raft logs for a message that was
+		// since delivered, or delivered and acked. The scan cursor was below the message
+		// when it was deferred, so the delivered stream sequence is our replay guard.
+		if seq <= o.state.Delivered.Stream {
+			continue
+		}
+		if o.state.Deferred == nil {
+			o.state.Deferred = make(map[uint64]struct{})
+		}
+		o.state.Deferred[seq] = struct{}{}
+		o.idx.pseqs.Insert(seq)
+		// The scan cursor did pass this message.
+		o.state.Delivered.Stream = seq
+	}
+	return nil
+}
+
 func (o *consumerMemStore) UpdateAcks(dseq, sseq uint64) error {
 	o.mu.Lock()
 	defer o.mu.Unlock()
@@ -2952,6 +3031,17 @@ func (o *consumerMemStore) UpdateAcks(dseq, sseq uint64) error {
 
 	// We do this regardless.
 	delete(o.state.Redelivered, sseq)
+	// A deferred message that is gone from the stream is dropped with a zero delivery
+	// sequence. Any other ack for a deferred sequence is stale and must not touch it.
+	if dseq == 0 && len(o.state.Deferred) > 0 {
+		if _, ok := o.state.Deferred[sseq]; ok {
+			delete(o.state.Deferred, sseq)
+			if o.idx != nil {
+				o.idx.pseqs.Delete(sseq)
+				o.state.AckFloor = o.idx.floors(o.state.Delivered)
+			}
+		}
+	}
 
 	// On restarts the old leader may get a replay from the raft logs that are old.
 	if dseq <= o.state.AckFloor.Consumer {
@@ -2980,6 +3070,10 @@ func (o *consumerMemStore) UpdateAcks(dseq, sseq uint64) error {
 				delete(o.state.Redelivered, seq)
 			}
 		}
+		// Not expected with the index, but keep it consistent.
+		if o.idx != nil {
+			o.idx = newAckIdx(&o.state)
+		}
 		return nil
 	}
 
@@ -2988,12 +3082,21 @@ func (o *consumerMemStore) UpdateAcks(dseq, sseq uint64) error {
 	// First delete from our pending state.
 	if p, ok := o.state.Pending[sseq]; ok {
 		delete(o.state.Pending, sseq)
+		if o.idx != nil {
+			o.idx.pseqs.Delete(sseq)
+			if p.Sequence > 0 {
+				o.idx.pdseqs.Delete(p.Sequence)
+			}
+		}
 		if dseq > p.Sequence && p.Sequence > 0 {
 			dseq = p.Sequence // Use the original.
 		}
 	}
 
-	if len(o.state.Pending) == 0 {
+	if o.idx != nil {
+		// Deliveries can be out of order, use the exact floors.
+		o.state.AckFloor = o.idx.floors(o.state.Delivered)
+	} else if len(o.state.Pending) == 0 {
 		o.state.AckFloor.Consumer = o.state.Delivered.Consumer
 		o.state.AckFloor.Stream = o.state.Delivered.Stream
 	} else if dseq == o.state.AckFloor.Consumer+1 {
@@ -3043,6 +3146,7 @@ func (o *consumerMemStore) UpdateConfig(cfg *ConsumerConfig) error {
 
 	// This is mostly unchecked here. We are assuming the upper layers have done sanity checking.
 	o.cfg = *cfg
+	o.rebuildIdxLocked()
 	return nil
 }
 
@@ -3097,6 +3201,13 @@ func (o *consumerMemStore) stateWithCopy(doCopy bool) (*ConsumerState, error) {
 			state.Redelivered = o.copyRedelivered()
 		} else {
 			state.Redelivered = o.state.Redelivered
+		}
+	}
+	if len(o.state.Deferred) > 0 {
+		if doCopy {
+			state.Deferred = copyDeferred(o.state.Deferred)
+		} else {
+			state.Deferred = o.state.Deferred
 		}
 	}
 	return state, nil

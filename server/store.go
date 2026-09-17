@@ -21,6 +21,7 @@ import (
 	"iter"
 	"math/bits"
 	"os"
+	"slices"
 	"strings"
 	"time"
 	"unsafe"
@@ -440,6 +441,7 @@ type ConsumerStore interface {
 	HasState() bool
 	UpdateDelivered(dseq, sseq, dc uint64, ts int64) error
 	UpdateAcks(dseq, sseq uint64) error
+	UpdateDeferred(seqs []uint64) error
 	RemoveRedeliveredBelow(seq uint64)
 	GetConfig() *ConsumerConfig
 	UpdateConfig(cfg *ConsumerConfig) error
@@ -472,6 +474,11 @@ type ConsumerState struct {
 	Pending map[uint64]*Pending `json:"pending,omitempty"`
 	// This is for messages that have been redelivered, so count > 1.
 	Redelivered map[uint64]uint64 `json:"redelivered,omitempty"`
+	// Deferred holds the stream sequences the consumer passed over because their
+	// max ack pending per subject tokens key was at its limit. They are above the
+	// stream ack floor, at or below the delivered stream sequence, never in Pending,
+	// and are delivered later in sequence order once their key has room.
+	Deferred map[uint64]struct{} `json:"deferred,omitempty"`
 }
 
 // Encode consumer state.
@@ -486,6 +493,11 @@ func encodeConsumerState(state *ConsumerState) []byte {
 	if lr := len(state.Redelivered); lr > 0 {
 		maxSize += lr*(2*binary.MaxVarintLen64) + binary.MaxVarintLen64
 	}
+	// The deferred section is only present in version 3, which we only emit when needed
+	// so that consumers without deferred messages keep producing version 2 as before.
+	if ld := len(state.Deferred); ld > 0 {
+		maxSize += ld*binary.MaxVarintLen64 + binary.MaxVarintLen64
+	}
 	if maxSize == seqsHdrSize {
 		buf = hdr[:seqsHdrSize]
 	} else {
@@ -494,7 +506,11 @@ func encodeConsumerState(state *ConsumerState) []byte {
 
 	// Write header
 	buf[0] = magic
-	buf[1] = 2
+	if len(state.Deferred) > 0 {
+		buf[1] = 3
+	} else {
+		buf[1] = 2
+	}
 
 	n := hdrLen
 	n += binary.PutUvarint(buf[n:], state.AckFloor.Consumer)
@@ -534,6 +550,14 @@ func encodeConsumerState(state *ConsumerState) []byte {
 		}
 	}
 
+	// Version 3 only, the deferred sequences. They are always above the ack floor.
+	if len(state.Deferred) > 0 {
+		n += binary.PutUvarint(buf[n:], uint64(len(state.Deferred)))
+		for k := range state.Deferred {
+			n += binary.PutUvarint(buf[n:], k-asflr)
+		}
+	}
+
 	return buf[:n]
 }
 
@@ -542,6 +566,100 @@ func encodeConsumerState(state *ConsumerState) []byte {
 type Pending struct {
 	Sequence  uint64
 	Timestamp int64
+}
+
+// ackIdx is a private index over a consumer state that is only maintained while the consumer
+// uses max ack pending per subject tokens, or still has state left over from it. Deferred
+// messages are delivered out of stream sequence order, so the ack floors can no longer be
+// derived by walking forward from an acked sequence: they are the minimum of these sets minus one.
+type ackIdx struct {
+	pseqs  *avl.SequenceSet // Pending and deferred stream sequences.
+	pdseqs *avl.SequenceSet // Pending consumer sequences, the original delivery sequences.
+}
+
+func newAckIdx(state *ConsumerState) *ackIdx {
+	idx := &ackIdx{pseqs: &avl.SequenceSet{}, pdseqs: &avl.SequenceSet{}}
+	for seq, p := range state.Pending {
+		idx.pseqs.Insert(seq)
+		if p != nil && p.Sequence > 0 {
+			idx.pdseqs.Insert(p.Sequence)
+		}
+	}
+	for seq := range state.Deferred {
+		idx.pseqs.Insert(seq)
+	}
+	return idx
+}
+
+// floors returns the exact ack floors: one below the lowest pending or deferred stream
+// sequence and one below the lowest pending consumer sequence, or the delivered
+// sequences when nothing is outstanding.
+func (idx *ackIdx) floors(delivered SequencePair) SequencePair {
+	flr := delivered
+	if !idx.pseqs.IsEmpty() {
+		min, _ := idx.pseqs.MinMax()
+		flr.Stream = min - 1
+	}
+	if !idx.pdseqs.IsEmpty() {
+		min, _ := idx.pdseqs.MinMax()
+		flr.Consumer = min - 1
+	}
+	return flr
+}
+
+// needAckIdx returns whether a consumer with this config and state needs exact ack floors.
+// This is the case while the feature is configured, while deferred messages exist, and while
+// pending messages delivered out of order remain after the feature was turned off.
+func needAckIdx(cfg *ConsumerConfig, state *ConsumerState) bool {
+	return len(cfg.MaxAckPendingPerSubjectTokens) > 0 || len(state.Deferred) > 0 || pendingOutOfOrder(state.Pending)
+}
+
+// pendingOutOfOrder returns whether the pending entries sorted by stream sequence are not in
+// increasing consumer sequence order, which is the case once deferred messages were delivered.
+func pendingOutOfOrder(pending map[uint64]*Pending) bool {
+	if len(pending) < 2 {
+		return false
+	}
+	seqs := make([]uint64, 0, len(pending))
+	for seq := range pending {
+		seqs = append(seqs, seq)
+	}
+	slices.Sort(seqs)
+	var last uint64
+	for _, seq := range seqs {
+		if p := pending[seq]; p != nil && p.Sequence > 0 {
+			if p.Sequence < last {
+				return true
+			}
+			last = p.Sequence
+		}
+	}
+	return false
+}
+
+// copyDeferred returns a copy of a deferred set, nil when empty.
+func copyDeferred(deferred map[uint64]struct{}) map[uint64]struct{} {
+	if len(deferred) == 0 {
+		return nil
+	}
+	cp := make(map[uint64]struct{}, len(deferred))
+	for seq := range deferred {
+		cp[seq] = struct{}{}
+	}
+	return cp
+}
+
+// checkDeferredState validates the deferred set of a state being installed into a store.
+func checkDeferredState(state *ConsumerState) error {
+	for seq := range state.Deferred {
+		if seq <= state.AckFloor.Stream || seq > state.Delivered.Stream {
+			return fmt.Errorf("bad deferred entry, sequence [%d] out of range", seq)
+		}
+		if _, ok := state.Pending[seq]; ok {
+			return fmt.Errorf("bad deferred entry, sequence [%d] is also pending", seq)
+		}
+	}
+	return nil
 }
 
 const (
