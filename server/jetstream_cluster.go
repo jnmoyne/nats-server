@@ -186,6 +186,8 @@ const (
 	batchCommitMsgOp
 	// Consumer rest to specific starting sequence.
 	resetSeqOp
+	// Consumer deferred messages, max ack pending per subject tokens.
+	updateDeferredOp
 )
 
 // raftGroups are controlled by the metagroup controller.
@@ -8848,6 +8850,25 @@ func (js *jetStream) applyConsumerEntries(o *consumer, ce *CommittedEntry, isLea
 					o.store.UpdateStarting(sseq - 1)
 				}
 				o.mu.Unlock()
+			case updateDeferredOp:
+				seqs, err := decodeDeferredUpdate(buf[1:])
+				if err != nil {
+					if mset, node := o.streamAndNode(); mset != nil && node != nil {
+						s := js.srv
+						s.Errorf("JetStream cluster could not decode consumer deferred update for '%s > %s > %s' [%s]",
+							mset.account(), mset.name(), o, node.Group())
+					}
+					return err
+				}
+				// Make sure to update deferred under the lock.
+				o.mu.Lock()
+				if o.store != nil {
+					err = o.store.UpdateDeferred(seqs)
+				}
+				o.mu.Unlock()
+				if err != nil {
+					return err
+				}
 			case resetSeqOp:
 				sseq, reply, err := decodeResetUpdate(buf[1:])
 				if err != nil {
@@ -9039,6 +9060,41 @@ func decodeResetUpdate(buf []byte) (sseq uint64, reply string, err error) {
 		return 0, _EMPTY_, errBadResetUpdate
 	}
 	return binary.LittleEndian.Uint64(buf[:8]), string(buf[8:]), nil
+}
+
+var errBadDeferredUpdate = errors.New("jetstream cluster bad replicated deferred update")
+
+// encodeDeferredUpdate encodes ascending deferred sequences as a count followed by deltas.
+func encodeDeferredUpdate(seqs []uint64) []byte {
+	b := make([]byte, 0, 1+(len(seqs)+1)*binary.MaxVarintLen64)
+	b = append(b, byte(updateDeferredOp))
+	b = binary.AppendUvarint(b, uint64(len(seqs)))
+	var last uint64
+	for _, seq := range seqs {
+		b = binary.AppendUvarint(b, seq-last)
+		last = seq
+	}
+	return b
+}
+
+func decodeDeferredUpdate(buf []byte) ([]uint64, error) {
+	n, bi := binary.Uvarint(buf)
+	// Each sequence takes at least one byte.
+	if bi <= 0 || n == 0 || n > uint64(len(buf)) {
+		return nil, errBadDeferredUpdate
+	}
+	seqs := make([]uint64, 0, n)
+	var last uint64
+	for i := uint64(0); i < n; i++ {
+		delta, m := binary.Uvarint(buf[bi:])
+		if m <= 0 {
+			return nil, errBadDeferredUpdate
+		}
+		bi += m
+		last += delta
+		seqs = append(seqs, last)
+	}
+	return seqs, nil
 }
 
 func (js *jetStream) processConsumerLeaderChange(o *consumer, isLeader bool, term uint64) error {

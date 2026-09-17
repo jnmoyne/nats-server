@@ -654,8 +654,13 @@ func (o *consumer) deferredForStoreLocked() map[uint64]struct{} {
 // updateDeferred records sequences the scan passed over because their key was at its limit.
 // Lock should be held.
 func (o *consumer) updateDeferred(seqs []uint64) {
-	// Clustered mode and R>1 is handled by replication, see the cluster entries.
-	if o.node == nil && o.store != nil {
+	if len(seqs) == 0 {
+		return
+	}
+	// Clustered mode and R>1.
+	if o.node != nil {
+		o.propose(encodeDeferredUpdate(seqs))
+	} else if o.store != nil {
 		o.store.UpdateDeferred(seqs)
 	}
 }

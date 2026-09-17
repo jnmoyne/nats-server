@@ -12400,3 +12400,229 @@ func TestJetStreamClusterScaleDownNotBlockedByUnaddedPeer(t *testing.T) {
 		require_Equal(t, status.Description, "selecting peers to scale down to")
 	})
 }
+
+func TestJetStreamClusterConsumerMaxAckPendingPerSubjectTokens(t *testing.T) {
+	c := createJetStreamClusterExplicit(t, "R3S", 3)
+	defer c.shutdown()
+
+	nc, js := jsClientConnect(t, c.randomServer())
+	defer func() { nc.Close() }()
+
+	_, err := js.AddStream(&nats.StreamConfig{Name: "TEST", Replicas: 3, Subjects: []string{"operations.>"}})
+	require_NoError(t, err)
+
+	perCustomer := []MaxAckPendingPerSubjectTokens{{Filter: "operations.*.>", Wildcards: []int{1}, MaxAckPending: 1}}
+	cfg := ConsumerConfig{Durable: "C", AckPolicy: AckExplicit, MaxAckPending: 100, Replicas: 3, MaxAckPendingPerSubjectTokens: perCustomer}
+
+	consumerRequest := func(t *testing.T, cfg ConsumerConfig, action ConsumerAction) {
+		t.Helper()
+		req, err := json.Marshal(CreateConsumerRequest{Stream: "TEST", Config: cfg, Action: action})
+		require_NoError(t, err)
+		rmsg, err := nc.Request(fmt.Sprintf(JSApiDurableCreateT, "TEST", cfg.Durable), req, 5*time.Second)
+		require_NoError(t, err)
+		var resp JSApiConsumerCreateResponse
+		require_NoError(t, json.Unmarshal(rmsg.Data, &resp))
+		if resp.Error != nil {
+			t.Fatalf("Unexpected error: %v", resp.Error)
+		}
+	}
+	info := func(t *testing.T) *ConsumerInfo {
+		t.Helper()
+		rmsg, err := nc.Request(fmt.Sprintf(JSApiConsumerInfoT, "TEST", "C"), nil, 5*time.Second)
+		require_NoError(t, err)
+		var resp JSApiConsumerInfoResponse
+		require_NoError(t, json.Unmarshal(rmsg.Data, &resp))
+		if resp.Error != nil {
+			t.Fatalf("Unexpected error: %v", resp.Error)
+		}
+		return resp.ConsumerInfo
+	}
+	expectInfo := func(t *testing.T, pending, deferred int, numPending uint64) {
+		t.Helper()
+		checkFor(t, 5*time.Second, 50*time.Millisecond, func() error {
+			ci := info(t)
+			if ci.NumAckPending != pending || ci.NumDeferred != deferred || ci.NumPending != numPending {
+				return fmt.Errorf("expected %d ack pending, %d deferred, %d pending, got %d, %d, %d",
+					pending, deferred, numPending, ci.NumAckPending, ci.NumDeferred, ci.NumPending)
+			}
+			return nil
+		})
+	}
+	publish := func(t *testing.T, subjects ...string) {
+		t.Helper()
+		for _, subj := range subjects {
+			_, err := js.Publish(subj, []byte("msg"))
+			require_NoError(t, err)
+		}
+	}
+	bind := func(t *testing.T) *nats.Subscription {
+		t.Helper()
+		sub, err := js.PullSubscribe(_EMPTY_, "C", nats.Bind("TEST", "C"))
+		require_NoError(t, err)
+		return sub
+	}
+	fetch := func(t *testing.T, sub *nats.Subscription, wait time.Duration, expected ...uint64) []*nats.Msg {
+		t.Helper()
+		msgs, err := sub.Fetch(10, nats.MaxWait(wait))
+		if err != nil && err != nats.ErrTimeout {
+			t.Fatalf("Unexpected error: %v", err)
+		}
+		var got []uint64
+		for _, m := range msgs {
+			md, err := m.Metadata()
+			require_NoError(t, err)
+			got = append(got, md.Sequence.Stream)
+		}
+		if !slices.Equal(got, expected) {
+			t.Fatalf("Expected sequences %v, got %v", expected, got)
+		}
+		return msgs
+	}
+	ackSeq := func(t *testing.T, msgs []*nats.Msg, seq uint64) {
+		t.Helper()
+		for _, m := range msgs {
+			if md, _ := m.Metadata(); md != nil && md.Sequence.Stream == seq {
+				require_NoError(t, m.AckSync())
+				return
+			}
+		}
+		t.Fatalf("No message with sequence %d", seq)
+	}
+	// All replicas agree on the persisted consumer state.
+	checkReplicas := func(t *testing.T, pending, deferred int, delivered, ackfloor uint64) {
+		t.Helper()
+		checkFor(t, 10*time.Second, 100*time.Millisecond, func() error {
+			for _, s := range c.servers {
+				mset, err := s.GlobalAccount().lookupStream("TEST")
+				if err != nil {
+					return err
+				}
+				o := mset.lookupConsumer("C")
+				if o == nil {
+					return fmt.Errorf("consumer not found on %s", s.Name())
+				}
+				state, err := o.store.State()
+				if err != nil {
+					return err
+				}
+				if len(state.Pending) != pending || len(state.Deferred) != deferred ||
+					state.Delivered.Stream != delivered || state.AckFloor.Stream != ackfloor {
+					return fmt.Errorf("%s: expected %d pending, %d deferred, delivered %d, ack floor %d, got %d, %d, %d, %d",
+						s.Name(), pending, deferred, delivered, ackfloor,
+						len(state.Pending), len(state.Deferred), state.Delivered.Stream, state.AckFloor.Stream)
+				}
+			}
+			return nil
+		})
+	}
+	stepDown := func(t *testing.T) {
+		t.Helper()
+		_, err := nc.Request(fmt.Sprintf(JSApiConsumerLeaderStepDownT, "TEST", "C"), nil, 5*time.Second)
+		require_NoError(t, err)
+		c.waitOnConsumerLeader(globalAccountName, "TEST", "C")
+	}
+
+	consumerRequest(t, cfg, ActionCreate)
+	c.waitOnConsumerLeader(globalAccountName, "TEST", "C")
+	sub := bind(t)
+
+	// Leader change: the new leader delivers the deferred messages in order and never
+	// redelivers the acked ones.
+	publish(t, "operations.X.a", "operations.Y.a", "operations.X.b", "operations.Z.a", "operations.X.c")
+	msgs := fetch(t, sub, 2*time.Second, 1, 2, 4)
+	ackSeq(t, msgs, 2)
+	ackSeq(t, msgs, 4)
+	checkReplicas(t, 1, 2, 5, 0)
+	expectInfo(t, 1, 2, 2)
+	stepDown(t)
+	expectInfo(t, 1, 2, 2)
+	fetch(t, sub, 300*time.Millisecond)
+	ackSeq(t, msgs, 1)
+	msgs = fetch(t, sub, 2*time.Second, 3)
+	ackSeq(t, msgs, 3)
+	msgs = fetch(t, sub, 2*time.Second, 5)
+	ackSeq(t, msgs, 5)
+	checkReplicas(t, 0, 0, 5, 5)
+	expectInfo(t, 0, 0, 0)
+
+	// A follower restarted from a snapshot with a deferred set delivers it once leader.
+	publish(t, "operations.X.d", "operations.X.e", "operations.X.f")
+	msgs = fetch(t, sub, 2*time.Second, 6)
+	checkReplicas(t, 1, 2, 8, 5)
+	f := c.randomNonConsumerLeader(globalAccountName, "TEST", "C")
+	mset, err := f.GlobalAccount().lookupStream("TEST")
+	require_NoError(t, err)
+	o := mset.lookupConsumer("C")
+	require_NotNil(t, o)
+	snap, err := o.store.EncodedState()
+	require_NoError(t, err)
+	require_Equal(t, snap[1], 3)
+	require_NoError(t, o.node.InstallSnapshot(snap, false))
+	f.Shutdown()
+	f.WaitForShutdown()
+	f = c.restartServer(f)
+	c.waitOnServerCurrent(f)
+	c.waitOnConsumerLeader(globalAccountName, "TEST", "C")
+	checkReplicas(t, 1, 2, 8, 5)
+	for i := 0; i < 10 && c.consumerLeader(globalAccountName, "TEST", "C") != f; i++ {
+		stepDown(t)
+	}
+	require_True(t, c.consumerLeader(globalAccountName, "TEST", "C") == f)
+	expectInfo(t, 1, 2, 2)
+	ackSeq(t, msgs, 6)
+	msgs = fetch(t, sub, 2*time.Second, 7)
+	ackSeq(t, msgs, 7)
+	msgs = fetch(t, sub, 2*time.Second, 8)
+	ackSeq(t, msgs, 8)
+	checkReplicas(t, 0, 0, 8, 8)
+
+	// A full restart replays the deferral after the delivery and the ack of the same
+	// message, nothing is resurrected.
+	publish(t, "operations.Y.b", "operations.Y.c", "operations.X.g")
+	msgs = fetch(t, sub, 2*time.Second, 9, 11)
+	ackSeq(t, msgs, 9)
+	m10 := fetch(t, sub, 2*time.Second, 10)
+	ackSeq(t, m10, 10)
+	ackSeq(t, msgs, 11)
+	checkReplicas(t, 0, 0, 11, 11)
+	nc.Close()
+	c.stopAll()
+	c.restartAll()
+	c.waitOnStreamLeader(globalAccountName, "TEST")
+	c.waitOnConsumerLeader(globalAccountName, "TEST", "C")
+	nc, js = jsClientConnect(t, c.randomServer())
+	checkReplicas(t, 0, 0, 11, 11)
+	expectInfo(t, 0, 0, 0)
+	sub = bind(t)
+	fetch(t, sub, 500*time.Millisecond)
+	publish(t, "operations.X.h")
+	msgs = fetch(t, sub, 2*time.Second, 12)
+	ackSeq(t, msgs, 12)
+
+	// Config updates in the cluster: re-key, then remove, then change leaders.
+	publish(t, "operations.X.i", "operations.X.j", "operations.Y.d")
+	msgs = fetch(t, sub, 2*time.Second, 13, 15)
+	expectInfo(t, 2, 1, 1)
+	cfg.MaxAckPendingPerSubjectTokens = []MaxAckPendingPerSubjectTokens{{Filter: "operations.*.*", Wildcards: []int{2}, MaxAckPending: 1}}
+	consumerRequest(t, cfg, ActionUpdate)
+	m14 := fetch(t, sub, 2*time.Second, 14)
+	checkReplicas(t, 3, 0, 15, 12)
+	publish(t, "operations.X.k", "operations.Y.k")
+	m16 := fetch(t, sub, 2*time.Second, 16)
+	expectInfo(t, 4, 1, 1)
+	cfg.MaxAckPendingPerSubjectTokens = nil
+	consumerRequest(t, cfg, ActionUpdate)
+	m17 := fetch(t, sub, 2*time.Second, 17)
+	expectInfo(t, 5, 0, 0)
+	stepDown(t)
+	fetch(t, sub, 300*time.Millisecond)
+	expectInfo(t, 5, 0, 0)
+	require_True(t, info(t).Config.MaxAckPendingPerSubjectTokens == nil)
+	ackSeq(t, msgs, 13)
+	ackSeq(t, m14, 14)
+	ackSeq(t, msgs, 15)
+	ackSeq(t, m16, 16)
+	ackSeq(t, m17, 17)
+	checkReplicas(t, 0, 0, 17, 17)
+	expectInfo(t, 0, 0, 0)
+}

@@ -173,8 +173,8 @@ func (js *jetStream) streamSnapshotV2(store StreamStore, state *StreamState, w i
 					Stream:   ci.AckFloor.Stream,
 				},
 			}
-			if ci.NumAckPending > 0 {
-				// Cluster consumer info does not include the sparse pending state.
+			if ci.NumAckPending > 0 || ci.NumDeferred > 0 {
+				// Cluster consumer info does not include the sparse pending and deferred state.
 				// Roll back to the ack floor so all possibly unacknowledged messages
 				// are delivered again instead of guessing which ones are pending.
 				state.Delivered = state.AckFloor
