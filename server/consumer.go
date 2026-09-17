@@ -64,6 +64,7 @@ type ConsumerInfo struct {
 	NumRedelivered int             `json:"num_redelivered"`
 	NumWaiting     int             `json:"num_waiting"`
 	NumPending     uint64          `json:"num_pending"`
+	NumDeferred    int             `json:"num_deferred,omitempty"`
 	Cluster        *ClusterInfo    `json:"cluster,omitempty"`
 	PushBound      bool            `json:"push_bound,omitempty"`
 	Paused         bool            `json:"paused,omitempty"`
@@ -139,6 +140,26 @@ type ConsumerConfig struct {
 	PriorityGroups []string       `json:"priority_groups,omitempty"`
 	PriorityPolicy PriorityPolicy `json:"priority_policy,omitempty"`
 	PinnedTTL      time.Duration  `json:"priority_timeout,omitempty"`
+
+	// MaxAckPendingPerSubjectTokens bounds the number of unacknowledged messages per key,
+	// the key being made of selected wildcard tokens of the message subject.
+	// An empty list disables the feature. Pull consumers with explicit acks only.
+	MaxAckPendingPerSubjectTokens []MaxAckPendingPerSubjectTokens `json:"max_ack_pending_per_subject_tokens,omitempty"`
+}
+
+// MaxAckPendingPerSubjectTokens limits the number of unacknowledged messages per key for the
+// messages matching Filter. The key is the concatenation of the values of the '*' tokens of
+// Filter selected by Wildcards, or the whole subject when Wildcards is empty. This is the same
+// rule partitioned consumer groups use to derive their partitioning key.
+type MaxAckPendingPerSubjectTokens struct {
+	// Filter is an ordinary subject filter selecting the messages in scope. Empty means ">".
+	Filter string `json:"filter"`
+	// Wildcards are the 1-based indexes, counted among the '*' tokens of Filter only, of the
+	// tokens whose values form the key. Empty means the whole subject is the key.
+	Wildcards []int `json:"wildcards,omitempty"`
+	// MaxAckPending is the maximum number of unacknowledged messages per key, >= 1.
+	// The consumer level MaxAckPending still applies across all keys.
+	MaxAckPending int `json:"max_ack_pending"`
 }
 
 // clone performs a deep copy of the ConsumerConfig struct, returning a new clone with
@@ -147,6 +168,15 @@ func (cfg *ConsumerConfig) clone() *ConsumerConfig {
 	clone := *cfg
 	if cfg.BackOff != nil {
 		clone.BackOff = slices.Clone(cfg.BackOff)
+	}
+	if cfg.MaxAckPendingPerSubjectTokens != nil {
+		clone.MaxAckPendingPerSubjectTokens = make([]MaxAckPendingPerSubjectTokens, len(cfg.MaxAckPendingPerSubjectTokens))
+		for i, e := range cfg.MaxAckPendingPerSubjectTokens {
+			if e.Wildcards != nil {
+				e.Wildcards = slices.Clone(e.Wildcards)
+			}
+			clone.MaxAckPendingPerSubjectTokens[i] = e
+		}
 	}
 	if cfg.FilterSubjects != nil {
 		clone.FilterSubjects = slices.Clone(cfg.FilterSubjects)
@@ -722,6 +752,86 @@ func setConsumerConfigDefaults(config *ConsumerConfig, streamCfg *StreamConfig, 
 		config.FlowControl = true
 		config.Heartbeat = sourceHealthHB
 	}
+
+	// Normalize the max ack pending per subject tokens entries so that JSON round trips
+	// and config comparisons never see spurious differences.
+	if len(config.MaxAckPendingPerSubjectTokens) == 0 {
+		config.MaxAckPendingPerSubjectTokens = nil
+	} else {
+		for i := range config.MaxAckPendingPerSubjectTokens {
+			e := &config.MaxAckPendingPerSubjectTokens[i]
+			if e.Filter == _EMPTY_ {
+				e.Filter = fwcs
+			}
+			if len(e.Wildcards) == 0 {
+				e.Wildcards = nil
+			}
+		}
+	}
+	return nil
+}
+
+// checkMaxAckPendingPerSubjectTokens validates the entries of MaxAckPendingPerSubjectTokens.
+// The push consumer and ack policy checks are done by the caller since they have their own errors.
+func checkMaxAckPendingPerSubjectTokens(config *ConsumerConfig) error {
+	entries := config.MaxAckPendingPerSubjectTokens
+	if len(entries) == 0 {
+		return nil
+	}
+	if config.DeliverPolicy == DeliverLastPerSubject {
+		return errors.New("deliver policy last per subject is not supported")
+	}
+	filters := gatherSubjectFilters(config.FilterSubject, config.FilterSubjects)
+	for i := range entries {
+		e := &entries[i]
+		filter := e.Filter
+		if filter == _EMPTY_ {
+			filter = fwcs
+		}
+		valid, _, npwcs, hasFwc := subjectInfo(filter)
+		if !valid || !IsValidSubject(filter) {
+			return fmt.Errorf("entry %d: invalid filter %q", i+1, filter)
+		}
+		if npwcs == 0 && !hasFwc {
+			return fmt.Errorf("entry %d: filter %q must contain at least one '*' or end in '>'", i+1, filter)
+		}
+		for j, w := range e.Wildcards {
+			if w < 1 || w > npwcs {
+				return fmt.Errorf("entry %d: wildcard index %d out of range, filter %q has %d '*' tokens", i+1, w, filter, npwcs)
+			}
+			for _, pw := range e.Wildcards[:j] {
+				if pw == w {
+					return fmt.Errorf("entry %d: duplicate wildcard index %d", i+1, w)
+				}
+			}
+		}
+		if e.MaxAckPending < 1 {
+			return fmt.Errorf("entry %d: max_ack_pending must be >= 1", i+1)
+		}
+		// Each entry must be able to overlap the consumer's filter subject(s) when filtered.
+		if len(filters) > 0 {
+			var overlaps bool
+			for _, f := range filters {
+				if SubjectsCollide(filter, f) {
+					overlaps = true
+					break
+				}
+			}
+			if !overlaps {
+				return fmt.Errorf("entry %d: filter %q does not overlap the consumer filter subjects", i+1, filter)
+			}
+		}
+		// Entries must not overlap each other.
+		for j := 0; j < i; j++ {
+			pf := entries[j].Filter
+			if pf == _EMPTY_ {
+				pf = fwcs
+			}
+			if SubjectsCollide(filter, pf) {
+				return fmt.Errorf("entry %d: filter %q overlaps entry %d filter %q", i+1, filter, j+1, pf)
+			}
+		}
+	}
 	return nil
 }
 
@@ -1019,6 +1129,19 @@ func checkConsumerCfg(
 		}
 		if config.PinnedTTL > 0 {
 			return NewJSConsumerPinnedTTLWithoutPriorityPolicyNoneError()
+		}
+	}
+
+	// Max ack pending per subject tokens is for pull consumers with explicit acks only.
+	if len(config.MaxAckPendingPerSubjectTokens) > 0 {
+		if config.DeliverSubject != _EMPTY_ {
+			return NewJSConsumerMaxAckPendingPerSubjectTokensPushError()
+		}
+		if config.AckPolicy != AckExplicit {
+			return NewJSConsumerMaxAckPendingPerSubjectTokensAckPolicyError()
+		}
+		if err := checkMaxAckPendingPerSubjectTokens(config); err != nil {
+			return NewJSConsumerMaxAckPendingPerSubjectTokensInvalidError(err)
 		}
 	}
 

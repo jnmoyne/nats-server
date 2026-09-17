@@ -14019,3 +14019,196 @@ func TestJetStreamConsumerEphemeralPullDefaultInactiveThresholdAfterRestart(t *t
 		return nil
 	})
 }
+
+func TestJetStreamConsumerMaxAckPendingPerSubjectTokensConfig(t *testing.T) {
+	single := RunBasicJetStreamServer(t)
+	defer single.Shutdown()
+	nc, js := jsClientConnect(t, single)
+	defer nc.Close()
+
+	cluster := createJetStreamClusterExplicit(t, "R3S", 3)
+	defer cluster.shutdown()
+	cnc, cjs := jsClientConnect(t, cluster.randomServer())
+	defer cnc.Close()
+
+	// Create a stream for both single server and clustered mode.
+	for _, server := range []struct {
+		replicas int
+		js       nats.JetStreamContext
+	}{
+		{1, js},
+		{3, cjs},
+	} {
+		_, err := server.js.AddStream(&nats.StreamConfig{
+			Name:     "TEST",
+			Subjects: []string{"operations.>", "billing.>", "other.>"},
+			Replicas: server.replicas,
+		})
+		require_NoError(t, err)
+	}
+	cluster.waitOnStreamLeader("$G", "TEST")
+
+	entry := func(filter string, wildcards []int, maxp int) MaxAckPendingPerSubjectTokens {
+		return MaxAckPendingPerSubjectTokens{Filter: filter, Wildcards: wildcards, MaxAckPending: maxp}
+	}
+	entries := func(e ...MaxAckPendingPerSubjectTokens) []MaxAckPendingPerSubjectTokens { return e }
+
+	consumerRequest := func(t *testing.T, nc *nats.Conn, cfg ConsumerConfig, action ConsumerAction) *JSApiConsumerCreateResponse {
+		t.Helper()
+		req, err := json.Marshal(CreateConsumerRequest{Stream: "TEST", Config: cfg, Action: action})
+		require_NoError(t, err)
+		rmsg, err := nc.Request(fmt.Sprintf(JSApiDurableCreateT, "TEST", cfg.Durable), req, 5*time.Second)
+		require_NoError(t, err)
+		var resp JSApiConsumerCreateResponse
+		require_NoError(t, json.Unmarshal(rmsg.Data, &resp))
+		return &resp
+	}
+	consumerInfo := func(t *testing.T, nc *nats.Conn, name string) *ConsumerInfo {
+		t.Helper()
+		rmsg, err := nc.Request(fmt.Sprintf(JSApiConsumerInfoT, "TEST", name), nil, 5*time.Second)
+		require_NoError(t, err)
+		var resp JSApiConsumerInfoResponse
+		require_NoError(t, json.Unmarshal(rmsg.Data, &resp))
+		require_True(t, resp.Error == nil)
+		require_True(t, resp.ConsumerInfo != nil)
+		return resp.ConsumerInfo
+	}
+
+	pushErr := uint16(JSConsumerMaxAckPendingPerSubjectTokensPushErr)
+	ackErr := uint16(JSConsumerMaxAckPendingPerSubjectTokensAckPolicyErr)
+	invalidErr := uint16(JSConsumerMaxAckPendingPerSubjectTokensInvalidErr)
+
+	for _, test := range []struct {
+		name string
+		cfg  ConsumerConfig
+		err  uint16
+	}{
+		{"single entry", ConsumerConfig{AckPolicy: AckExplicit,
+			MaxAckPendingPerSubjectTokens: entries(entry("operations.*.>", []int{1}, 1))}, 0},
+		{"multiple entries", ConsumerConfig{AckPolicy: AckExplicit,
+			MaxAckPendingPerSubjectTokens: entries(entry("operations.*.>", []int{1}, 1), entry("billing.*.*", []int{2}, 5))}, 0},
+		{"empty filter means everything", ConsumerConfig{AckPolicy: AckExplicit,
+			MaxAckPendingPerSubjectTokens: entries(entry(_EMPTY_, nil, 1))}, 0},
+		{"whole subject key", ConsumerConfig{AckPolicy: AckExplicit,
+			MaxAckPendingPerSubjectTokens: entries(entry("operations.*.*", nil, 2))}, 0},
+		{"several wildcards", ConsumerConfig{AckPolicy: AckExplicit,
+			MaxAckPendingPerSubjectTokens: entries(entry("operations.*.*", []int{2, 1}, 2))}, 0},
+		{"limit above consumer max ack pending", ConsumerConfig{AckPolicy: AckExplicit, MaxAckPending: 10,
+			MaxAckPendingPerSubjectTokens: entries(entry("operations.*.>", []int{1}, 100))}, 0},
+		{"entry overlaps one of the consumer filters", ConsumerConfig{AckPolicy: AckExplicit, FilterSubjects: []string{"billing.>", "operations.>"},
+			MaxAckPendingPerSubjectTokens: entries(entry("operations.*.>", []int{1}, 1))}, 0},
+		{"push consumer", ConsumerConfig{AckPolicy: AckExplicit, DeliverSubject: "deliver",
+			MaxAckPendingPerSubjectTokens: entries(entry("operations.*.>", []int{1}, 1))}, pushErr},
+		{"ack none", ConsumerConfig{AckPolicy: AckNone,
+			MaxAckPendingPerSubjectTokens: entries(entry("operations.*.>", []int{1}, 1))}, ackErr},
+		{"ack all", ConsumerConfig{AckPolicy: AckAll,
+			MaxAckPendingPerSubjectTokens: entries(entry("operations.*.>", []int{1}, 1))}, ackErr},
+		{"deliver last per subject", ConsumerConfig{AckPolicy: AckExplicit, DeliverPolicy: DeliverLastPerSubject, FilterSubject: "operations.>",
+			MaxAckPendingPerSubjectTokens: entries(entry("operations.*.>", []int{1}, 1))}, invalidErr},
+		{"filter without wildcard", ConsumerConfig{AckPolicy: AckExplicit,
+			MaxAckPendingPerSubjectTokens: entries(entry("operations.x.y", nil, 1))}, invalidErr},
+		{"invalid filter", ConsumerConfig{AckPolicy: AckExplicit,
+			MaxAckPendingPerSubjectTokens: entries(entry("operations..*", nil, 1))}, invalidErr},
+		{"wildcard index zero", ConsumerConfig{AckPolicy: AckExplicit,
+			MaxAckPendingPerSubjectTokens: entries(entry("operations.*.>", []int{0}, 1))}, invalidErr},
+		{"wildcard index out of range", ConsumerConfig{AckPolicy: AckExplicit,
+			MaxAckPendingPerSubjectTokens: entries(entry("operations.*.*", []int{3}, 1))}, invalidErr},
+		{"wildcard index counts only star tokens", ConsumerConfig{AckPolicy: AckExplicit,
+			MaxAckPendingPerSubjectTokens: entries(entry("operations.*.>", []int{2}, 1))}, invalidErr},
+		{"duplicate wildcard index", ConsumerConfig{AckPolicy: AckExplicit,
+			MaxAckPendingPerSubjectTokens: entries(entry("operations.*.*", []int{1, 1}, 1))}, invalidErr},
+		{"max ack pending zero", ConsumerConfig{AckPolicy: AckExplicit,
+			MaxAckPendingPerSubjectTokens: entries(entry("operations.*.>", []int{1}, 0))}, invalidErr},
+		{"max ack pending negative", ConsumerConfig{AckPolicy: AckExplicit,
+			MaxAckPendingPerSubjectTokens: entries(entry("operations.*.>", []int{1}, -1))}, invalidErr},
+		{"overlapping entries", ConsumerConfig{AckPolicy: AckExplicit,
+			MaxAckPendingPerSubjectTokens: entries(entry("operations.*.>", []int{1}, 1), entry("operations.*.deposit", []int{1}, 1))}, invalidErr},
+		{"entry outside consumer filter", ConsumerConfig{AckPolicy: AckExplicit, FilterSubject: "billing.>",
+			MaxAckPendingPerSubjectTokens: entries(entry("operations.*.>", []int{1}, 1))}, invalidErr},
+	} {
+		for _, server := range []struct {
+			name string
+			nc   *nats.Conn
+		}{
+			{"R1", nc},
+			{"R3", cnc},
+		} {
+			t.Run(server.name+"/"+test.name, func(t *testing.T) {
+				cfg := test.cfg
+				cfg.Durable = strings.ReplaceAll(test.name, " ", "_")
+				resp := consumerRequest(t, server.nc, cfg, ActionCreate)
+				if test.err != 0 {
+					require_True(t, resp.Error != nil)
+					require_Equal(t, resp.Error.ErrCode, test.err)
+				} else {
+					require_True(t, resp.Error == nil)
+				}
+			})
+		}
+	}
+
+	// An empty filter is stored as ">".
+	for _, c := range []*nats.Conn{nc, cnc} {
+		ci := consumerInfo(t, c, "empty_filter_means_everything")
+		require_True(t, reflect.DeepEqual(ci.Config.MaxAckPendingPerSubjectTokens, entries(entry(fwcs, nil, 1))))
+	}
+
+	// Config round trip through create, info and update, single server and clustered.
+	for _, server := range []struct {
+		name string
+		nc   *nats.Conn
+	}{
+		{"R1", nc},
+		{"R3", cnc},
+	} {
+		t.Run(server.name+"/round trip", func(t *testing.T) {
+			cfg := ConsumerConfig{
+				Durable:       "RT",
+				AckPolicy:     AckExplicit,
+				MaxAckPending: 1000,
+				MaxAckPendingPerSubjectTokens: entries(
+					entry("operations.*.>", []int{1}, 1),
+					entry("billing.*.*", []int{2}, 5),
+					entry("other.*", []int{}, 3),
+				),
+			}
+			resp := consumerRequest(t, server.nc, cfg, ActionCreate)
+			if resp.Error != nil {
+				t.Fatalf("Unexpected error: %v", resp.Error)
+			}
+			// Empty wildcards are normalized.
+			expected := entries(
+				entry("operations.*.>", []int{1}, 1),
+				entry("billing.*.*", []int{2}, 5),
+				entry("other.*", nil, 3),
+			)
+			require_True(t, reflect.DeepEqual(resp.ConsumerInfo.Config.MaxAckPendingPerSubjectTokens, expected))
+			ci := consumerInfo(t, server.nc, "RT")
+			require_True(t, reflect.DeepEqual(ci.Config.MaxAckPendingPerSubjectTokens, expected))
+			require_Equal(t, ci.NumDeferred, 0)
+
+			// Update the entries.
+			cfg.MaxAckPendingPerSubjectTokens = entries(entry("operations.*.*", []int{1, 2}, 2))
+			resp = consumerRequest(t, server.nc, cfg, ActionUpdate)
+			require_True(t, resp.Error == nil)
+			ci = consumerInfo(t, server.nc, "RT")
+			require_True(t, reflect.DeepEqual(ci.Config.MaxAckPendingPerSubjectTokens, cfg.MaxAckPendingPerSubjectTokens))
+
+			// Invalid update is rejected and leaves the config untouched.
+			bad := cfg
+			bad.MaxAckPendingPerSubjectTokens = entries(entry("operations.*.*", []int{5}, 2))
+			resp = consumerRequest(t, server.nc, bad, ActionUpdate)
+			require_True(t, resp.Error != nil)
+			require_Equal(t, resp.Error.ErrCode, invalidErr)
+			ci = consumerInfo(t, server.nc, "RT")
+			require_True(t, reflect.DeepEqual(ci.Config.MaxAckPendingPerSubjectTokens, cfg.MaxAckPendingPerSubjectTokens))
+
+			// Remove the entries.
+			cfg.MaxAckPendingPerSubjectTokens = nil
+			resp = consumerRequest(t, server.nc, cfg, ActionUpdate)
+			require_True(t, resp.Error == nil)
+			ci = consumerInfo(t, server.nc, "RT")
+			require_True(t, ci.Config.MaxAckPendingPerSubjectTokens == nil)
+		})
+	}
+}

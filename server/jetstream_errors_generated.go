@@ -209,6 +209,15 @@ const (
 	// JSConsumerInvalidSamplingErrF failed to parse consumer sampling configuration: {err}
 	JSConsumerInvalidSamplingErrF ErrorIdentifier = 10095
 
+	// JSConsumerMaxAckPendingPerSubjectTokensAckPolicyErr max ack pending per subject tokens requires explicit ack policy
+	JSConsumerMaxAckPendingPerSubjectTokensAckPolicyErr ErrorIdentifier = 10230
+
+	// JSConsumerMaxAckPendingPerSubjectTokensInvalidErr invalid max ack pending per subject tokens: {err}
+	JSConsumerMaxAckPendingPerSubjectTokensInvalidErr ErrorIdentifier = 10231
+
+	// JSConsumerMaxAckPendingPerSubjectTokensPushErr max ack pending per subject tokens requires a pull consumer
+	JSConsumerMaxAckPendingPerSubjectTokensPushErr ErrorIdentifier = 10229
+
 	// JSConsumerMaxDeliverBackoffErr max deliver is required to be > length of backoff values
 	JSConsumerMaxDeliverBackoffErr ErrorIdentifier = 10116
 
@@ -916,6 +925,9 @@ var (
 		JSStreamWrongLastSequenceErrF:                {Code: 400, ErrCode: 10071, Description: "wrong last sequence: {seq}"},
 		JSTempStorageFailedErr:                       {Code: 500, ErrCode: 10072, Description: "JetStream unable to open temp storage for restore"},
 		JSTemplateNameNotMatchSubjectErr:             {Code: 400, ErrCode: 10073, Description: "template name in subject does not match request"},
+		JSConsumerMaxAckPendingPerSubjectTokensAckPolicyErr: {Code: 400, ErrCode: 10230, Description: "max ack pending per subject tokens requires explicit ack policy"},
+		JSConsumerMaxAckPendingPerSubjectTokensInvalidErr:   {Code: 400, ErrCode: 10231, Description: "invalid max ack pending per subject tokens: {err}"},
+		JSConsumerMaxAckPendingPerSubjectTokensPushErr:      {Code: 400, ErrCode: 10229, Description: "max ack pending per subject tokens requires a pull consumer"},
 	}
 	// ErrJetStreamNotClustered Deprecated by JSClusterNotActiveErr ApiError, use IsNatsError() for comparisons
 	ErrJetStreamNotClustered = ApiErrors[JSClusterNotActiveErr]
@@ -1679,6 +1691,42 @@ func NewJSConsumerInvalidSamplingError(err error, opts ...ErrorOption) *ApiError
 		ErrCode:     e.ErrCode,
 		Description: strings.NewReplacer(args...).Replace(e.Description),
 	}
+}
+
+// NewJSConsumerMaxAckPendingPerSubjectTokensAckPolicyError creates a new JSConsumerMaxAckPendingPerSubjectTokensAckPolicyErr error: "max ack pending per subject tokens requires explicit ack policy"
+func NewJSConsumerMaxAckPendingPerSubjectTokensAckPolicyError(opts ...ErrorOption) *ApiError {
+	eopts := parseOpts(opts)
+	if ae, ok := eopts.err.(*ApiError); ok {
+		return ae
+	}
+
+	return ApiErrors[JSConsumerMaxAckPendingPerSubjectTokensAckPolicyErr]
+}
+
+// NewJSConsumerMaxAckPendingPerSubjectTokensInvalidError creates a new JSConsumerMaxAckPendingPerSubjectTokensInvalidErr error: "invalid max ack pending per subject tokens: {err}"
+func NewJSConsumerMaxAckPendingPerSubjectTokensInvalidError(err error, opts ...ErrorOption) *ApiError {
+	eopts := parseOpts(opts)
+	if ae, ok := eopts.err.(*ApiError); ok {
+		return ae
+	}
+
+	e := ApiErrors[JSConsumerMaxAckPendingPerSubjectTokensInvalidErr]
+	args := e.toReplacerArgs([]interface{}{"{err}", err})
+	return &ApiError{
+		Code:        e.Code,
+		ErrCode:     e.ErrCode,
+		Description: strings.NewReplacer(args...).Replace(e.Description),
+	}
+}
+
+// NewJSConsumerMaxAckPendingPerSubjectTokensPushError creates a new JSConsumerMaxAckPendingPerSubjectTokensPushErr error: "max ack pending per subject tokens requires a pull consumer"
+func NewJSConsumerMaxAckPendingPerSubjectTokensPushError(opts ...ErrorOption) *ApiError {
+	eopts := parseOpts(opts)
+	if ae, ok := eopts.err.(*ApiError); ok {
+		return ae
+	}
+
+	return ApiErrors[JSConsumerMaxAckPendingPerSubjectTokensPushErr]
 }
 
 // NewJSConsumerMaxDeliverBackoffError creates a new JSConsumerMaxDeliverBackoffErr error: "max deliver is required to be > length of backoff values"

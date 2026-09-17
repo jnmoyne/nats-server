@@ -17,7 +17,7 @@ import "strconv"
 
 const (
 	// JSApiLevel is the maximum supported JetStream API level for this server.
-	JSApiLevel int = 5
+	JSApiLevel int = 6
 
 	JSRequiredLevelMetadataKey = "_nats.req.level"
 	JSServerVersionMetadataKey = "_nats.ver"
@@ -166,6 +166,12 @@ func setStaticConsumerMetadata(cfg *ConsumerConfig) {
 	// Added in 2.14
 	if cfg.AckPolicy == AckFlowControl {
 		requires(4)
+	}
+
+	// Max ack pending per subject tokens was added in 2.16 and requires API level 6.
+	// Older servers can not apply its replicated deferred state.
+	if len(cfg.MaxAckPendingPerSubjectTokens) > 0 {
+		requires(6)
 	}
 
 	cfg.Metadata[JSRequiredLevelMetadataKey] = strconv.Itoa(requiredApiLevel)

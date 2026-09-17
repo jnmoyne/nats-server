@@ -2268,5 +2268,35 @@
     "help": "",
     "url": "",
     "deprecates": ""
+  },
+  {
+    "constant": "JSConsumerMaxAckPendingPerSubjectTokensPushErr",
+    "code": 400,
+    "error_code": 10229,
+    "description": "max ack pending per subject tokens requires a pull consumer",
+    "comment": "",
+    "help": "",
+    "url": "",
+    "deprecates": ""
+  },
+  {
+    "constant": "JSConsumerMaxAckPendingPerSubjectTokensAckPolicyErr",
+    "code": 400,
+    "error_code": 10230,
+    "description": "max ack pending per subject tokens requires explicit ack policy",
+    "comment": "",
+    "help": "",
+    "url": "",
+    "deprecates": ""
+  },
+  {
+    "constant": "JSConsumerMaxAckPendingPerSubjectTokensInvalidErr",
+    "code": 400,
+    "error_code": 10231,
+    "description": "invalid max ack pending per subject tokens: {err}",
+    "comment": "",
+    "help": "",
+    "url": "",
+    "deprecates": ""
   }
 ]

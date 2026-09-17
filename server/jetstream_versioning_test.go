@@ -259,6 +259,13 @@ func TestJetStreamSetStaticConsumerMetadata(t *testing.T) {
 			cfg:              &ConsumerConfig{AckPolicy: AckFlowControl},
 			expectedMetadata: metadataAtLevel("4"),
 		},
+		{
+			desc: "MaxAckPendingPerSubjectTokens",
+			cfg: &ConsumerConfig{MaxAckPendingPerSubjectTokens: []MaxAckPendingPerSubjectTokens{
+				{Filter: "foo.*", Wildcards: []int{1}, MaxAckPending: 1},
+			}},
+			expectedMetadata: metadataAtLevel("6"),
+		},
 	} {
 		t.Run(test.desc, func(t *testing.T) {
 			setStaticConsumerMetadata(test.cfg)
