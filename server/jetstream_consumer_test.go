@@ -23,6 +23,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"math/rand/v2"
 	"net/url"
 	os "os"
@@ -3202,7 +3203,7 @@ func TestJetStreamConsumerMessageDeletedDuringRedelivery(t *testing.T) {
 			o.dseq, o.sseq = 11, 11
 
 			// Getting the next message should skip seq 2, as that's deleted. Should clean up the state.
-			_, _, err = o.getNextMsg()
+			_, _, _, err = o.getNextMsg()
 			o.mu.Unlock()
 			require_Error(t, err, ErrStoreEOF)
 
@@ -14211,4 +14212,496 @@ func TestJetStreamConsumerMaxAckPendingPerSubjectTokensConfig(t *testing.T) {
 			require_True(t, ci.Config.MaxAckPendingPerSubjectTokens == nil)
 		})
 	}
+}
+
+func TestJetStreamConsumerMaxAckPendingPerSubjectTokens(t *testing.T) {
+	for _, storage := range []nats.StorageType{nats.MemoryStorage, nats.FileStorage} {
+		t.Run(storage.String(), func(t *testing.T) {
+			testJetStreamConsumerMaxAckPendingPerSubjectTokens(t, storage)
+		})
+	}
+}
+
+func testJetStreamConsumerMaxAckPendingPerSubjectTokens(t *testing.T, storage nats.StorageType) {
+	s := RunBasicJetStreamServer(t)
+	defer func() { s.Shutdown() }()
+	nc, js := jsClientConnect(t, s)
+	defer func() { nc.Close() }()
+
+	entries := func(e ...MaxAckPendingPerSubjectTokens) []MaxAckPendingPerSubjectTokens { return e }
+	perCustomer := entries(MaxAckPendingPerSubjectTokens{Filter: "operations.*.>", Wildcards: []int{1}, MaxAckPending: 1})
+
+	newStream := func(t *testing.T, retention nats.RetentionPolicy) {
+		t.Helper()
+		_ = js.DeleteStream("TEST")
+		_, err := js.AddStream(&nats.StreamConfig{
+			Name:      "TEST",
+			Subjects:  []string{"operations.>"},
+			Storage:   storage,
+			Retention: retention,
+		})
+		require_NoError(t, err)
+	}
+	consumerRequest := func(t *testing.T, cfg ConsumerConfig, action ConsumerAction) *ConsumerInfo {
+		t.Helper()
+		req, err := json.Marshal(CreateConsumerRequest{Stream: "TEST", Config: cfg, Action: action})
+		require_NoError(t, err)
+		rmsg, err := nc.Request(fmt.Sprintf(JSApiDurableCreateT, "TEST", cfg.Durable), req, 5*time.Second)
+		require_NoError(t, err)
+		var resp JSApiConsumerCreateResponse
+		require_NoError(t, json.Unmarshal(rmsg.Data, &resp))
+		if resp.Error != nil {
+			t.Fatalf("Unexpected error: %v", resp.Error)
+		}
+		return resp.ConsumerInfo
+	}
+	newConsumer := func(t *testing.T, name string, e []MaxAckPendingPerSubjectTokens, mod func(*ConsumerConfig)) *nats.Subscription {
+		t.Helper()
+		cfg := ConsumerConfig{Durable: name, AckPolicy: AckExplicit, MaxAckPending: 100, MaxAckPendingPerSubjectTokens: e}
+		if mod != nil {
+			mod(&cfg)
+		}
+		consumerRequest(t, cfg, ActionCreate)
+		sub, err := js.PullSubscribe(_EMPTY_, name, nats.Bind("TEST", name))
+		require_NoError(t, err)
+		return sub
+	}
+	info := func(t *testing.T, name string) *ConsumerInfo {
+		t.Helper()
+		rmsg, err := nc.Request(fmt.Sprintf(JSApiConsumerInfoT, "TEST", name), nil, 5*time.Second)
+		require_NoError(t, err)
+		var resp JSApiConsumerInfoResponse
+		require_NoError(t, json.Unmarshal(rmsg.Data, &resp))
+		if resp.Error != nil {
+			t.Fatalf("Unexpected error: %v", resp.Error)
+		}
+		return resp.ConsumerInfo
+	}
+	publish := func(t *testing.T, subjects ...string) {
+		t.Helper()
+		for _, subj := range subjects {
+			_, err := js.Publish(subj, []byte("msg"))
+			require_NoError(t, err)
+		}
+	}
+	fetch := func(t *testing.T, sub *nats.Subscription, n int, wait time.Duration) []*nats.Msg {
+		t.Helper()
+		msgs, err := sub.Fetch(n, nats.MaxWait(wait))
+		if err != nil && err != nats.ErrTimeout {
+			t.Fatalf("Unexpected error: %v", err)
+		}
+		return msgs
+	}
+	seqs := func(t *testing.T, msgs []*nats.Msg) []uint64 {
+		t.Helper()
+		var res []uint64
+		for _, m := range msgs {
+			md, err := m.Metadata()
+			require_NoError(t, err)
+			res = append(res, md.Sequence.Stream)
+		}
+		return res
+	}
+	expectSeqs := func(t *testing.T, msgs []*nats.Msg, expected ...uint64) {
+		t.Helper()
+		if got := seqs(t, msgs); !slices.Equal(got, expected) {
+			t.Fatalf("Expected sequences %v, got %v", expected, got)
+		}
+	}
+	msgBySeq := func(t *testing.T, msgs []*nats.Msg, seq uint64) *nats.Msg {
+		t.Helper()
+		for _, m := range msgs {
+			if md, _ := m.Metadata(); md != nil && md.Sequence.Stream == seq {
+				return m
+			}
+		}
+		t.Fatalf("No message with sequence %d", seq)
+		return nil
+	}
+	ack := func(t *testing.T, m *nats.Msg) {
+		t.Helper()
+		require_NoError(t, m.AckSync())
+	}
+	expectInfo := func(t *testing.T, name string, pending, deferred int, numPending uint64) {
+		t.Helper()
+		ci := info(t, name)
+		if ci.NumAckPending != pending || ci.NumDeferred != deferred || ci.NumPending != numPending {
+			t.Fatalf("Expected %d ack pending, %d deferred, %d pending, got %d, %d, %d",
+				pending, deferred, numPending, ci.NumAckPending, ci.NumDeferred, ci.NumPending)
+		}
+	}
+
+	t.Run("ordering per key", func(t *testing.T) {
+		newStream(t, nats.LimitsPolicy)
+		publish(t, "operations.X.deposit", "operations.X.withdrawal", "operations.Y.deposit",
+			"operations.Y.withdrawal", "operations.X.close", "operations.Z.deposit")
+		sub := newConsumer(t, "C", perCustomer, nil)
+
+		// One message per customer, the rest is deferred.
+		msgs := fetch(t, sub, 10, 500*time.Millisecond)
+		expectSeqs(t, msgs, 1, 3, 6)
+		expectInfo(t, "C", 3, 3, 3)
+		expectSeqs(t, fetch(t, sub, 10, 250*time.Millisecond))
+
+		// Acking Y releases Y's next message only.
+		ack(t, msgBySeq(t, msgs, 3))
+		m4 := fetch(t, sub, 10, 500*time.Millisecond)
+		expectSeqs(t, m4, 4)
+		expectInfo(t, "C", 3, 2, 2)
+
+		// Acking X releases X's messages in order, one at a time.
+		ack(t, msgBySeq(t, msgs, 1))
+		m2 := fetch(t, sub, 10, 500*time.Millisecond)
+		expectSeqs(t, m2, 2)
+		expectSeqs(t, fetch(t, sub, 10, 250*time.Millisecond))
+		ack(t, m2[0])
+		m5 := fetch(t, sub, 10, 500*time.Millisecond)
+		expectSeqs(t, m5, 5)
+
+		ack(t, m4[0])
+		ack(t, m5[0])
+		ack(t, msgBySeq(t, msgs, 6))
+		expectInfo(t, "C", 0, 0, 0)
+		ci := info(t, "C")
+		require_Equal(t, ci.AckFloor.Stream, 6)
+		require_Equal(t, ci.Delivered.Stream, 6)
+	})
+
+	t.Run("redelivery keeps the key blocked", func(t *testing.T) {
+		newStream(t, nats.LimitsPolicy)
+		publish(t, "operations.X.a", "operations.X.b", "operations.Y.a")
+		sub := newConsumer(t, "R", perCustomer, func(cfg *ConsumerConfig) { cfg.AckWait = 200 * time.Millisecond })
+
+		msgs := fetch(t, sub, 10, 500*time.Millisecond)
+		expectSeqs(t, msgs, 1, 3)
+		ack(t, msgBySeq(t, msgs, 3))
+
+		// Ack wait expiry redelivers 1, X stays blocked.
+		msgs = fetch(t, sub, 10, time.Second)
+		expectSeqs(t, msgs, 1)
+		md, _ := msgs[0].Metadata()
+		require_Equal(t, md.NumDelivered, 2)
+		expectInfo(t, "R", 1, 1, 1)
+
+		// Nak redelivers 1, X stays blocked.
+		require_NoError(t, msgs[0].Nak())
+		msgs = fetch(t, sub, 10, time.Second)
+		expectSeqs(t, msgs, 1)
+		md, _ = msgs[0].Metadata()
+		require_Equal(t, md.NumDelivered, 3)
+
+		// Nak with delay as well.
+		require_NoError(t, msgs[0].NakWithDelay(100*time.Millisecond))
+		msgs = fetch(t, sub, 10, time.Second)
+		expectSeqs(t, msgs, 1)
+
+		// In progress keeps it blocked.
+		require_NoError(t, msgs[0].InProgress())
+		expectSeqs(t, fetch(t, sub, 10, 100*time.Millisecond))
+
+		// Term releases X.
+		require_NoError(t, msgs[0].Term())
+		msgs = fetch(t, sub, 10, time.Second)
+		expectSeqs(t, msgs, 2)
+		ack(t, msgs[0])
+		expectInfo(t, "R", 0, 0, 0)
+	})
+
+	t.Run("max deliver releases the key", func(t *testing.T) {
+		newStream(t, nats.LimitsPolicy)
+		publish(t, "operations.X.a", "operations.X.b")
+		sub := newConsumer(t, "M", perCustomer, func(cfg *ConsumerConfig) {
+			cfg.AckWait = 200 * time.Millisecond
+			cfg.MaxDeliver = 2
+		})
+		msgs := fetch(t, sub, 10, 500*time.Millisecond)
+		expectSeqs(t, msgs, 1)
+		// Redelivered once more.
+		msgs = fetch(t, sub, 10, time.Second)
+		expectSeqs(t, msgs, 1)
+		// Max deliver exhausted releases X, 2 gets delivered.
+		msgs = fetch(t, sub, 10, 2*time.Second)
+		expectSeqs(t, msgs, 2)
+		ack(t, msgs[0])
+		expectInfo(t, "M", 0, 0, 0)
+	})
+
+	t.Run("lookahead bound stalls", func(t *testing.T) {
+		newStream(t, nats.LimitsPolicy)
+		for i := 0; i < 10; i++ {
+			publish(t, "operations.X.a")
+		}
+		publish(t, "operations.Y.a")
+		sub := newConsumer(t, "L", perCustomer, func(cfg *ConsumerConfig) { cfg.MaxAckPending = 5 })
+
+		// Only the first X message, then we stall after deferring 5 messages, Y is not reached.
+		msgs := fetch(t, sub, 10, 500*time.Millisecond)
+		expectSeqs(t, msgs, 1)
+		expectInfo(t, "L", 1, 5, 10)
+		expectSeqs(t, fetch(t, sub, 10, 250*time.Millisecond))
+
+		// Each ack lets the next X message through and the scan defer one more.
+		last := msgs[0]
+		for seq := uint64(2); seq <= 5; seq++ {
+			ack(t, last)
+			msgs = fetch(t, sub, 10, 500*time.Millisecond)
+			expectSeqs(t, msgs, seq)
+			expectInfo(t, "L", 1, 5, 11-seq)
+			last = msgs[0]
+		}
+		// Now the scan gets past the X backlog and reaches Y.
+		ack(t, last)
+		msgs = fetch(t, sub, 10, 500*time.Millisecond)
+		expectSeqs(t, msgs, 6, 11)
+		expectInfo(t, "L", 2, 4, 4)
+	})
+
+	t.Run("config update re-keys and removal drains", func(t *testing.T) {
+		newStream(t, nats.LimitsPolicy)
+		publish(t, "operations.X.a", "operations.X.b", "operations.Y.a")
+		sub := newConsumer(t, "U", perCustomer, nil)
+		msgs := fetch(t, sub, 10, 500*time.Millisecond)
+		expectSeqs(t, msgs, 1, 3)
+		expectInfo(t, "U", 2, 1, 1)
+
+		// Per operation kind instead: "b" has room now.
+		cfg := ConsumerConfig{Durable: "U", AckPolicy: AckExplicit, MaxAckPending: 100,
+			MaxAckPendingPerSubjectTokens: entries(MaxAckPendingPerSubjectTokens{Filter: "operations.*.*", Wildcards: []int{2}, MaxAckPending: 1})}
+		consumerRequest(t, cfg, ActionUpdate)
+		m2 := fetch(t, sub, 10, 500*time.Millisecond)
+		expectSeqs(t, m2, 2)
+		expectInfo(t, "U", 3, 0, 0)
+
+		// "c" is a new key: the first goes through, the second is deferred.
+		publish(t, "operations.X.c", "operations.Y.c")
+		m4 := fetch(t, sub, 10, 500*time.Millisecond)
+		expectSeqs(t, m4, 4)
+		expectInfo(t, "U", 4, 1, 1)
+
+		// Removing the entries drains the deferred message.
+		cfg.MaxAckPendingPerSubjectTokens = nil
+		consumerRequest(t, cfg, ActionUpdate)
+		m5 := fetch(t, sub, 10, 500*time.Millisecond)
+		expectSeqs(t, m5, 5)
+		expectInfo(t, "U", 5, 0, 0)
+		require_True(t, info(t, "U").Config.MaxAckPendingPerSubjectTokens == nil)
+
+		for _, m := range [][]*nats.Msg{msgs, m2, m4, m5} {
+			for _, msg := range m {
+				ack(t, msg)
+			}
+		}
+		expectInfo(t, "U", 0, 0, 0)
+
+		// Turning it back on with things pending accounts them.
+		publish(t, "operations.X.d", "operations.X.e")
+		m6 := fetch(t, sub, 10, 500*time.Millisecond)
+		expectSeqs(t, m6, 6, 7)
+		cfg.MaxAckPendingPerSubjectTokens = perCustomer
+		consumerRequest(t, cfg, ActionUpdate)
+		publish(t, "operations.X.f")
+		expectSeqs(t, fetch(t, sub, 10, 250*time.Millisecond))
+		expectInfo(t, "U", 2, 1, 1)
+		ack(t, m6[0])
+		expectSeqs(t, fetch(t, sub, 10, 250*time.Millisecond))
+		ack(t, m6[1])
+		expectSeqs(t, fetch(t, sub, 10, 500*time.Millisecond), 8)
+	})
+
+	t.Run("interest retention keeps deferred messages", func(t *testing.T) {
+		newStream(t, nats.InterestPolicy)
+		subI := newConsumer(t, "I", perCustomer, nil)
+		subO := newConsumer(t, "O", nil, nil)
+		publish(t, "operations.X.a", "operations.X.b")
+
+		msgs := fetch(t, subI, 10, 500*time.Millisecond)
+		expectSeqs(t, msgs, 1)
+		others := fetch(t, subO, 10, 500*time.Millisecond)
+		expectSeqs(t, others, 1, 2)
+		for _, m := range others {
+			ack(t, m)
+		}
+		// We still have interest in both.
+		si, err := js.StreamInfo("TEST")
+		require_NoError(t, err)
+		require_Equal(t, si.State.Msgs, 2)
+
+		ack(t, msgs[0])
+		checkFor(t, 2*time.Second, 50*time.Millisecond, func() error {
+			si, err := js.StreamInfo("TEST")
+			if err != nil {
+				return err
+			}
+			if si.State.Msgs != 1 {
+				return fmt.Errorf("expected 1 message, got %d", si.State.Msgs)
+			}
+			return nil
+		})
+		msgs = fetch(t, subI, 10, 500*time.Millisecond)
+		expectSeqs(t, msgs, 2)
+		ack(t, msgs[0])
+		checkFor(t, 2*time.Second, 50*time.Millisecond, func() error {
+			si, err := js.StreamInfo("TEST")
+			if err != nil {
+				return err
+			}
+			if si.State.Msgs != 0 {
+				return fmt.Errorf("expected 0 messages, got %d", si.State.Msgs)
+			}
+			return nil
+		})
+	})
+
+	t.Run("deleted and purged deferred messages", func(t *testing.T) {
+		newStream(t, nats.LimitsPolicy)
+		publish(t, "operations.X.a", "operations.X.b", "operations.X.c")
+		sub := newConsumer(t, "D", perCustomer, nil)
+		msgs := fetch(t, sub, 10, 500*time.Millisecond)
+		expectSeqs(t, msgs, 1)
+		expectInfo(t, "D", 1, 2, 2)
+
+		// Deleting a deferred message drops it.
+		require_NoError(t, js.DeleteMsg("TEST", 2))
+		checkFor(t, 2*time.Second, 50*time.Millisecond, func() error {
+			if ci := info(t, "D"); ci.NumDeferred != 1 || ci.NumPending != 1 {
+				return fmt.Errorf("expected 1 deferred and 1 pending, got %d and %d", ci.NumDeferred, ci.NumPending)
+			}
+			return nil
+		})
+		ack(t, msgs[0])
+		msgs = fetch(t, sub, 10, 500*time.Millisecond)
+		expectSeqs(t, msgs, 3)
+
+		// A purge drops them all.
+		publish(t, "operations.X.d", "operations.X.e")
+		expectInfo(t, "D", 1, 0, 2)
+		expectSeqs(t, fetch(t, sub, 10, 250*time.Millisecond))
+		expectInfo(t, "D", 1, 2, 2)
+		require_NoError(t, js.PurgeStream("TEST"))
+		checkFor(t, 2*time.Second, 50*time.Millisecond, func() error {
+			if ci := info(t, "D"); ci.NumDeferred != 0 || ci.NumAckPending != 0 || ci.NumPending != 0 {
+				return fmt.Errorf("expected nothing outstanding, got %+v", ci)
+			}
+			return nil
+		})
+		publish(t, "operations.X.f", "operations.X.g")
+		msgs = fetch(t, sub, 10, 500*time.Millisecond)
+		expectSeqs(t, msgs, 6)
+		expectInfo(t, "D", 1, 1, 1)
+	})
+
+	t.Run("work queue", func(t *testing.T) {
+		newStream(t, nats.WorkQueuePolicy)
+		sub := newConsumer(t, "W", perCustomer, nil)
+		publish(t, "operations.X.a", "operations.X.b", "operations.X.c", "operations.Y.a")
+		msgs := fetch(t, sub, 10, 500*time.Millisecond)
+		expectSeqs(t, msgs, 1, 4)
+		ack(t, msgBySeq(t, msgs, 4))
+		m1 := msgBySeq(t, msgs, 1)
+
+		if storage == nats.FileStorage {
+			// Restart, the deferred messages are restored and Y is not redelivered.
+			sd := s.JetStreamConfig().StoreDir
+			nc.Close()
+			s.Shutdown()
+			s = RunJetStreamServerOnPort(-1, sd)
+			nc, js = jsClientConnect(t, s)
+			expectInfo(t, "W", 1, 2, 2)
+			var err error
+			sub, err = js.PullSubscribe(_EMPTY_, "W", nats.Bind("TEST", "W"))
+			require_NoError(t, err)
+			expectSeqs(t, fetch(t, sub, 10, 250*time.Millisecond))
+			// Ack the message delivered before the restart.
+			require_NoError(t, nc.Publish(m1.Reply, nil))
+			require_NoError(t, nc.Flush())
+		} else {
+			ack(t, m1)
+		}
+		msgs = fetch(t, sub, 10, time.Second)
+		expectSeqs(t, msgs, 2)
+		ack(t, msgs[0])
+		msgs = fetch(t, sub, 10, time.Second)
+		expectSeqs(t, msgs, 3)
+		ack(t, msgs[0])
+		expectInfo(t, "W", 0, 0, 0)
+		checkFor(t, 2*time.Second, 50*time.Millisecond, func() error {
+			si, err := js.StreamInfo("TEST")
+			if err != nil {
+				return err
+			}
+			if si.State.Msgs != 0 {
+				return fmt.Errorf("expected 0 messages, got %d", si.State.Msgs)
+			}
+			return nil
+		})
+	})
+
+	t.Run("restart delivers deferred and never acked", func(t *testing.T) {
+		if storage != nats.FileStorage {
+			t.Skip("file storage only")
+		}
+		newStream(t, nats.LimitsPolicy)
+		publish(t, "operations.X.a", "operations.Y.a", "operations.X.b", "operations.Z.a", "operations.X.c")
+		sub := newConsumer(t, "S", perCustomer, nil)
+		msgs := fetch(t, sub, 10, 500*time.Millisecond)
+		expectSeqs(t, msgs, 1, 2, 4)
+		// Ack Y and Z, X stays pending with 3 and 5 deferred.
+		ack(t, msgBySeq(t, msgs, 2))
+		ack(t, msgBySeq(t, msgs, 4))
+		expectInfo(t, "S", 1, 2, 2)
+		ci := info(t, "S")
+		require_Equal(t, ci.AckFloor.Stream, 0)
+
+		sd := s.JetStreamConfig().StoreDir
+		nc.Close()
+		s.Shutdown()
+		s = RunJetStreamServerOnPort(-1, sd)
+		nc, js = jsClientConnect(t, s)
+		expectInfo(t, "S", 1, 2, 2)
+		var err error
+		sub, err = js.PullSubscribe(_EMPTY_, "S", nats.Bind("TEST", "S"))
+		require_NoError(t, err)
+		require_NoError(t, nc.Publish(msgBySeq(t, msgs, 1).Reply, nil))
+		require_NoError(t, nc.Flush())
+		// 3 then 5, and never 2 or 4 again.
+		msgs = fetch(t, sub, 10, time.Second)
+		expectSeqs(t, msgs, 3)
+		ack(t, msgs[0])
+		msgs = fetch(t, sub, 10, time.Second)
+		expectSeqs(t, msgs, 5)
+		ack(t, msgs[0])
+		expectInfo(t, "S", 0, 0, 0)
+		ci = info(t, "S")
+		require_Equal(t, ci.AckFloor.Stream, 5)
+	})
+
+	t.Run("backup and restore", func(t *testing.T) {
+		newStream(t, nats.LimitsPolicy)
+		publish(t, "operations.X.a", "operations.X.b")
+		sub := newConsumer(t, "B", perCustomer, nil)
+		msgs := fetch(t, sub, 10, 500*time.Millisecond)
+		expectSeqs(t, msgs, 1)
+		ack(t, msgs[0])
+		// Nothing pending but a deferred message.
+		expectInfo(t, "B", 0, 1, 1)
+
+		mset, err := s.GlobalAccount().lookupStream("TEST")
+		require_NoError(t, err)
+		scfg := mset.config()
+		sr, err := mset.snapshot(5*time.Second, false, true)
+		require_NoError(t, err)
+		snapshot, err := io.ReadAll(sr.Reader)
+		require_NoError(t, err)
+		require_NoError(t, js.DeleteStream("TEST"))
+		_, err = s.GlobalAccount().RestoreStreamV2(&scfg, bytes.NewReader(snapshot))
+		require_NoError(t, err)
+
+		expectInfo(t, "B", 0, 1, 1)
+		sub, err = js.PullSubscribe(_EMPTY_, "B", nats.Bind("TEST", "B"))
+		require_NoError(t, err)
+		msgs = fetch(t, sub, 10, time.Second)
+		expectSeqs(t, msgs, 2)
+		ack(t, msgs[0])
+		expectInfo(t, "B", 0, 0, 0)
+	})
 }

@@ -520,6 +520,7 @@ type consumer struct {
 	rdq               []uint64
 	rdqi              avl.SequenceSet
 	rdc               map[uint64]uint64
+	ackLimits         *ackLimits // Max ack pending per subject tokens runtime, leader only.
 	replies           map[uint64]string
 	pendingDeliveries map[uint64]*jsPubMsg        // Messages that can be delivered after achieving quorum.
 	waitingDeliveries map[string]*waitingDelivery // (Optional) request timeout messages that need to wait for replicated deliveries first.
@@ -1494,7 +1495,7 @@ func (mset *stream) addConsumerWithAssignmentAndMode(config *ConsumerConfig, ona
 				o.acc.Name, o.stream, o.name, sseq, lseq)
 
 			o.mu.Lock()
-			o.reconcileStateWithStream(lseq)
+			deferred := o.reconcileStateWithStream(lseq)
 
 			// Save the reconciled state
 			state := &ConsumerState{
@@ -1508,6 +1509,7 @@ func (mset *stream) addConsumerWithAssignmentAndMode(config *ConsumerConfig, ona
 				},
 				Pending:     o.pending,
 				Redelivered: o.rdc,
+				Deferred:    deferred,
 			}
 			err := o.store.ForceUpdate(state)
 			o.mu.Unlock()
@@ -1846,6 +1848,7 @@ func (o *consumer) setLeader(isLeader bool, term uint64) error {
 	o.rdq = nil
 	o.rdqi.Empty()
 	o.pending = nil
+	o.ackLimits = nil
 	o.rsm = nil
 	o.resetPendingDeliveries()
 	// Reset num pending, these are only authoritative on the leader.
@@ -1929,6 +1932,10 @@ func (o *consumer) setLeader(isLeader bool, term uint64) error {
 			o.readStoredState()
 		} else if o.node != nil && o.sseq >= 1 {
 			o.updateSkipped(o.sseq)
+		}
+		// Setup max ack pending per subject tokens if we did not restore it from state.
+		if o.ackLimits == nil {
+			o.setupAckLimitsLocked(nil)
 		}
 
 		// Setup initial num pending.
@@ -2567,6 +2574,7 @@ func (o *consumer) hasMaxDeliveries(seq uint64) bool {
 			delete(o.pending, seq)
 			// Increment by one, since the delivery count hasn't been increased above.
 			o.updateDelivered(p.Sequence, seq, dc+1, p.Timestamp)
+			o.releasePendingLocked(seq, p.Sequence)
 			o.moveAckFloor(p.Sequence, seq)
 		}
 		// Ensure redelivered state is set, if not already.
@@ -2869,9 +2877,25 @@ func (o *consumer) updateConfig(cfg *ConsumerConfig) error {
 		}
 	}
 
+	// Max ack pending per subject tokens, we re-key on any change.
+	limitsChanged := !reflect.DeepEqual(cfg.MaxAckPendingPerSubjectTokens, o.cfg.MaxAckPendingPerSubjectTokens)
+
 	// Record new config for others that do not need special handling.
 	// Allowed but considered no-op, [Description, SampleFrequency, MaxWaiting, HeadersOnly]
 	o.cfg = *cfg
+
+	if o.isLeader() {
+		if limitsChanged {
+			var deferred map[uint64]struct{}
+			if o.ackLimits != nil {
+				deferred = o.ackLimits.deferredSet()
+			}
+			o.setupAckLimitsLocked(deferred)
+			o.signalNewMessages()
+		} else if o.ackLimits != nil {
+			o.ackLimits.setLimit(o.maxp)
+		}
+	}
 
 	if cfg.Sourcing && (!o.srv.JetStreamIsClustered() && o.srv.standAloneMode()) {
 		o.resetStartingSeqLocked(0, _EMPTY_, false, false)
@@ -3144,6 +3168,9 @@ func (o *consumer) resetLocalStartingSeq(seq uint64) bool {
 	o.sseq, o.dseq = seq, 1
 	o.adflr, o.asflr = o.dseq-1, o.sseq-1
 	o.ldt, o.lat = time.Time{}, time.Time{}
+	if o.isLeader() {
+		o.setupAckLimitsLocked(nil)
+	}
 	return recalcPending
 }
 
@@ -3601,6 +3628,11 @@ func (o *consumer) applyState(state *ConsumerState) {
 		}
 		o.resetPtmr(delay)
 	}
+
+	// Rebuild the max ack pending per subject tokens runtime from the restored state.
+	if o.isLeader() {
+		o.setupAckLimitsLocked(state.Deferred)
+	}
 }
 
 // Sets our store state from another source. Used in clustered mode on snapshot restore.
@@ -3645,6 +3677,7 @@ func (o *consumer) writeStoreStateUnlocked() error {
 		},
 		Pending:     o.pending,
 		Redelivered: o.rdc,
+		Deferred:    o.deferredForStoreLocked(),
 	}
 	return o.store.Update(&state)
 }
@@ -3739,6 +3772,7 @@ func (o *consumer) infoWithSnapAndReply(snap bool, reply string) *ConsumerInfo {
 		NumAckPending:  len(o.pending),
 		NumRedelivered: len(o.rdc),
 		NumPending:     np,
+		NumDeferred:    o.numDeferred(),
 		PushBound:      o.isPushMode() && o.active,
 		TimeStamp:      time.Now().UTC(),
 		PriorityGroups: priorityGroups,
@@ -3774,6 +3808,7 @@ func (o *consumer) infoWithSnapAndReply(snap bool, reply string) *ConsumerInfo {
 		if !leader {
 			info.NumAckPending = len(state.Pending)
 			info.NumRedelivered = len(state.Redelivered)
+			info.NumDeferred = len(state.Deferred)
 		}
 	}
 
@@ -3913,6 +3948,11 @@ func (o *consumer) processAckMsgLocked(sseq, dseq, dc uint64, reply string, doSa
 		unlock()
 		return false
 	}
+	// An ack for a message we deferred and have not delivered yet is stale, ignore it.
+	if o.ackLimits != nil && o.ackLimits.isDeferred(sseq) {
+		unlock()
+		return false
+	}
 
 	// Let the owning stream know if we are interest or workqueue retention based.
 	// If this consumer is clustered (o.node != nil) this will be handled by
@@ -3934,6 +3974,9 @@ func (o *consumer) processAckMsgLocked(sseq, dseq, dc uint64, reply string, doSa
 				needSignal = true
 			}
 			delete(o.pending, sseq)
+			if o.ackLimits != nil && o.ackLimits.release(sseq, p.Sequence) {
+				needSignal = true
+			}
 			// Use the original deliver sequence from our pending record.
 			dseq = p.Sequence
 			o.moveAckFloor(dseq, sseq)
@@ -4013,6 +4056,11 @@ func (o *consumer) processAckMsgLocked(sseq, dseq, dc uint64, reply string, doSa
 
 // Lock should be held.
 func (o *consumer) moveAckFloor(dseq, sseq uint64) {
+	// Deliveries can be out of order with max ack pending per subject tokens, use the exact floors.
+	if o.ackLimits != nil {
+		o.adflr, o.asflr = o.ackLimits.floors(o)
+		return
+	}
 	// Only move floors if we matched an existing pending.
 	if len(o.pending) == 0 {
 		o.adflr = o.dseq - 1
@@ -4109,6 +4157,10 @@ func (o *consumer) needAck(sseq uint64, subj string) bool {
 	if o.isLeader() {
 		asflr, osseq = o.asflr, o.sseq
 		pending, rdc = o.pending, o.rdc
+		// Deferred messages are still ours to deliver.
+		if o.ackLimits != nil && o.ackLimits.isDeferred(sseq) {
+			return true
+		}
 	} else {
 		if o.store == nil {
 			return false
@@ -4120,6 +4172,10 @@ func (o *consumer) needAck(sseq uint64, subj string) bool {
 		}
 		// If loading state as here, the osseq is +1.
 		asflr, osseq, pending, rdc = state.AckFloor.Stream, state.Delivered.Stream+1, state.Pending, state.Redelivered
+		// Deferred messages are still to be delivered.
+		if _, ok := state.Deferred[sseq]; ok {
+			return true
+		}
 	}
 
 	switch o.cfg.AckPolicy {
@@ -5106,10 +5162,18 @@ var (
 
 // Get next available message from underlying store.
 // Is partition aware and redeliver aware.
+// Returns the message, its delivery count and whether it comes from the deferred set.
 // Lock should be held.
-func (o *consumer) getNextMsg() (*jsPubMsg, uint64, error) {
+func (o *consumer) getNextMsg() (*jsPubMsg, uint64, bool, error) {
 	if o.mset == nil || o.mset.store == nil {
-		return nil, 0, errBadConsumer
+		return nil, 0, false, errBadConsumer
+	}
+	al := o.ackLimits
+	if al != nil {
+		// Classify what was above our stream replica's last sequence when we became leader.
+		for _, seq := range al.resolve(o) {
+			o.dropDeferredLocked(seq)
+		}
 	}
 	// Process redelivered messages before looking at possibly "skip list" (deliver last per subject)
 	if o.hasRedeliveries() {
@@ -5124,6 +5188,7 @@ func (o *consumer) getNextMsg() (*jsPubMsg, uint64, error) {
 					delete(o.pending, seq)
 					// The delivery count has already been incremented once.
 					o.updateDelivered(p.Sequence, seq, dc, p.Timestamp)
+					o.releasePendingLocked(seq, p.Sequence)
 					o.moveAckFloor(p.Sequence, seq)
 				}
 				continue
@@ -5150,7 +5215,7 @@ func (o *consumer) getNextMsg() (*jsPubMsg, uint64, error) {
 				}
 				continue
 			}
-			return pmsg, dc, err
+			return pmsg, dc, false, err
 		}
 	}
 
@@ -5158,7 +5223,34 @@ func (o *consumer) getNextMsg() (*jsPubMsg, uint64, error) {
 	if o.maxp > 0 && len(o.pending) >= o.maxp {
 		// maxp only set when ack policy != AckNone and user set MaxAckPending
 		// Stall if we have hit max pending.
-		return nil, 0, errMaxAckPending
+		return nil, 0, false, errMaxAckPending
+	}
+
+	if al != nil {
+		// Deferred messages whose key has room go first, lowest sequence first.
+		for {
+			seq, ok := al.nextReady()
+			if !ok {
+				break
+			}
+			pmsg := getJSPubMsgFromPool()
+			sm, err := o.mset.store.LoadMsg(seq, &pmsg.StoreMsg)
+			if sm != nil && err == nil {
+				al.takeReady(seq)
+				return pmsg, 1, true, nil
+			}
+			pmsg.returnToPool()
+			if err == ErrStoreMsgNotFound || err == errDeletedMsg {
+				// Removed from the stream in the meantime, drop it and look at the next one.
+				o.dropDeferredLocked(seq)
+				continue
+			}
+			return nil, 0, false, err
+		}
+		// Bound how far past the oldest deferred message we scan, stall like max ack pending.
+		if al.ndeferred() >= al.limit {
+			return nil, 0, false, errMaxAckPending
+		}
 	}
 
 	if o.hasSkipListPending() {
@@ -5178,29 +5270,59 @@ func (o *consumer) getNextMsg() (*jsPubMsg, uint64, error) {
 			pmsg = nil
 		}
 		o.sseq++
-		return pmsg, 1, err
+		return pmsg, 1, false, err
 	}
 
 	var sseq uint64
 	var err error
 	var sm *StoreMsg
 	var pmsg = getJSPubMsgFromPool()
+	var deferred []uint64
 
 	// Grab next message applicable to us.
 	filters, subjf, fseq := o.filters, o.subjf, o.sseq
-	// Check if we are multi-filtered or not.
-	if filters != nil {
-		sm, sseq, err = o.mset.store.LoadNextMsgMulti(filters, fseq, &pmsg.StoreMsg)
-	} else if len(subjf) > 0 { // Means single filtered subject since o.filters means > 1.
-		filter, wc := subjf[0].subject, subjf[0].hasWildcard
-		sm, sseq, err = o.mset.store.LoadNextMsg(filter, wc, fseq, &pmsg.StoreMsg)
-	} else {
-		// No filter here.
-		sm, sseq, err = o.mset.store.LoadNextMsg(_EMPTY_, false, fseq, &pmsg.StoreMsg)
+	for {
+		// Check if we are multi-filtered or not.
+		if filters != nil {
+			sm, sseq, err = o.mset.store.LoadNextMsgMulti(filters, fseq, &pmsg.StoreMsg)
+		} else if len(subjf) > 0 { // Means single filtered subject since o.filters means > 1.
+			filter, wc := subjf[0].subject, subjf[0].hasWildcard
+			sm, sseq, err = o.mset.store.LoadNextMsg(filter, wc, fseq, &pmsg.StoreMsg)
+		} else {
+			// No filter here.
+			sm, sseq, err = o.mset.store.LoadNextMsg(_EMPTY_, false, fseq, &pmsg.StoreMsg)
+		}
+		if al == nil || sm == nil || err != nil {
+			break
+		}
+		// Never hand out a deferred message from the scan, it goes through the deferred set.
+		if al.isDeferred(sseq) {
+			fseq = sseq + 1
+			continue
+		}
+		if al.admit(sseq, sm.subj) {
+			break
+		}
+		// Its key is at its limit, defer it and keep scanning up to our bound.
+		deferred = append(deferred, sseq)
+		o.npc--
+		fseq = sseq + 1
+		if al.ndeferred() >= al.limit {
+			sm, err = nil, errMaxAckPending
+			break
+		}
 	}
 	if sm == nil {
 		pmsg.returnToPool()
 		pmsg = nil
+	}
+	if len(deferred) > 0 {
+		// Record the deferrals before moving our cursor, this must precede any skip update.
+		o.updateDeferred(deferred)
+		// Our cursor always moves past what we deferred.
+		if last := deferred[len(deferred)-1]; sseq < last || err == errMaxAckPending {
+			sseq = last
+		}
 	}
 	// Check if we should move our o.sseq.
 	if sseq >= o.sseq {
@@ -5211,7 +5333,7 @@ func (o *consumer) getNextMsg() (*jsPubMsg, uint64, error) {
 		}
 		o.sseq = sseq + 1
 	}
-	return pmsg, 1, err
+	return pmsg, 1, false, err
 }
 
 // Will check for expiration and lack of interest on waiting requests.
@@ -5402,6 +5524,16 @@ func (o *consumer) checkAckFloor() {
 		return
 	}
 
+	// Deferred messages that no longer exist are dropped. With something outstanding
+	// the exact floors need no further correction.
+	if o.ackLimits != nil {
+		o.dropDeferredBelowLocked(ss.FirstSeq)
+		if !o.ackLimits.empty() {
+			o.adflr, o.asflr = o.ackLimits.floors(o)
+			return
+		}
+	}
+
 	// If we are here, and this should be rare, we still are off with our ack floor.
 	// We will make sure we are not doing un-necessary work here if only off by a bit
 	// since this could be normal for a high activity wq or stream.
@@ -5571,13 +5703,14 @@ func (o *consumer) loopAndGatherMsgs(qch chan struct{}) {
 	// Deliver all the msgs we have now, once done or on a condition, we wait for new ones.
 	for {
 		var (
-			pmsg     *jsPubMsg
-			dc       uint64
-			dsubj    string
-			ackReply string
-			delay    time.Duration
-			sz       int
-			wrn, wrb int
+			pmsg         *jsPubMsg
+			dc           uint64
+			fromDeferred bool
+			dsubj        string
+			ackReply     string
+			delay        time.Duration
+			sz           int
+			wrn, wrb     int
 		)
 
 		o.mu.Lock()
@@ -5609,7 +5742,7 @@ func (o *consumer) loopAndGatherMsgs(qch chan struct{}) {
 		}
 
 		// Grab our next msg.
-		pmsg, dc, err = o.getNextMsg()
+		pmsg, dc, fromDeferred, err = o.getNextMsg()
 
 		// We can release the lock now under getNextMsg so need to check this condition again here.
 		if o.closed || o.mset == nil {
@@ -5638,7 +5771,8 @@ func (o *consumer) loopAndGatherMsgs(qch chan struct{}) {
 		}
 
 		// Update our cached num pending here first.
-		if dc == 1 {
+		// Deferred messages left the count when they were deferred.
+		if dc == 1 && !fromDeferred {
 			o.npc--
 		}
 		// Pre-calculate ackReply
@@ -5673,9 +5807,17 @@ func (o *consumer) loopAndGatherMsgs(qch chan struct{}) {
 			// Need to also test that this is not going backwards since if
 			// we fail to deliver we can end up here from rdq but we do not
 			// want to decrement o.sseq if that is the case.
-			if dc == 1 && pmsg.seq == o.sseq-1 {
+			if fromDeferred {
+				// It stays deferred, put it back at the head of its key.
+				if o.ackLimits != nil {
+					o.ackLimits.undeliverDeferred(pmsg.seq)
+				}
+			} else if dc == 1 && pmsg.seq == o.sseq-1 {
 				o.sseq--
 				o.npc++
+				if o.ackLimits != nil {
+					o.ackLimits.undeliver(pmsg.seq)
+				}
 			} else if !o.onRedeliverQueue(pmsg.seq) {
 				// We are not on the rdq so decrement the delivery count
 				// and add it back.
@@ -5838,7 +5980,7 @@ func (o *consumer) checkNumPending() (uint64, error) {
 	if o.mset != nil && o.mset.store != nil {
 		var state StreamState
 		o.mset.store.FastState(&state)
-		npc := o.numPending()
+		npc := o.numPendingScan()
 		// Make sure we can't report more messages than there are.
 		// TODO(nat): It's not great that this means consumer info has side effects,
 		// since we can't know whether anyone will call it or not. The previous num
@@ -5852,8 +5994,20 @@ func (o *consumer) checkNumPending() (uint64, error) {
 	return o.numPending(), nil
 }
 
+// numPending returns the number of messages left to deliver, including deferred messages.
 // Lock should be held.
 func (o *consumer) numPending() uint64 {
+	np := o.numPendingScan()
+	if o.ackLimits != nil {
+		np += uint64(o.ackLimits.ndeferred())
+	}
+	return np
+}
+
+// numPendingScan returns the number of messages left to deliver from our cursor on,
+// which excludes deferred messages.
+// Lock should be held.
+func (o *consumer) numPendingScan() uint64 {
 	if o.npc < 0 {
 		return 0
 	}
@@ -6128,6 +6282,9 @@ func (o *consumer) trackPending(sseq, dseq uint64) {
 		p.Timestamp = now.UnixNano()
 	} else {
 		o.pending[sseq] = &Pending{dseq, now.UnixNano()}
+		if o.ackLimits != nil {
+			o.ackLimits.tracked(dseq)
+		}
 	}
 
 	// We could have a backoff that set a timer higher than what we need for this message.
@@ -6285,6 +6442,11 @@ func (o *consumer) checkPending() {
 		next = int64(o.cfg.BackOff[l-1])
 	}
 
+	// Deferred messages that no longer exist are dropped.
+	if o.dropDeferredBelowLocked(fseq) {
+		shouldUpdateState = true
+	}
+
 	// Since we can update timestamps, we have to review all pending.
 	// We will now bail if we see an ack pending inbound to us via o.awl.
 	var expired []uint64
@@ -6299,6 +6461,7 @@ func (o *consumer) checkPending() {
 			delete(o.pending, seq)
 			delete(o.rdc, seq)
 			o.removeFromRedeliverQueue(seq)
+			o.releasePendingLocked(seq, p.Sequence)
 			shouldUpdateState = true
 			// Check if we need to move ack floors.
 			if seq > o.asflr {
@@ -6367,6 +6530,11 @@ func (o *consumer) checkPending() {
 		o.pending = nil
 		// Mimic behavior in processAckMsg when pending is empty.
 		o.adflr, o.asflr = o.dseq-1, o.sseq-1
+	}
+	if o.ackLimits != nil {
+		// Deferred messages may remain, use the exact floors.
+		o.adflr, o.asflr = o.ackLimits.floors(o)
+		o.maybeDropAckLimitsLocked()
 	}
 
 	// Update our state if needed.
@@ -6461,7 +6629,10 @@ func (o *consumer) hasSkipListPending() bool {
 // due to data loss (e.g., VM crash). This handles the case where consumer state
 // is ahead of the stream's last sequence.
 // Lock should be held.
-func (o *consumer) reconcileStateWithStream(streamLastSeq uint64) {
+func (o *consumer) reconcileStateWithStream(streamLastSeq uint64) map[uint64]struct{} {
+	// Deferred messages are part of our state as well.
+	deferred := copyDeferred(o.deferredForStoreLocked())
+
 	// If an ack floor is higher than stream last sequence,
 	// reset back down but keep the highest known sequences.
 	if o.asflr > streamLastSeq {
@@ -6474,6 +6645,7 @@ func (o *consumer) reconcileStateWithStream(streamLastSeq uint64) {
 		}
 		o.pending = nil
 		o.rdc = nil
+		deferred = nil
 	}
 
 	// Remove pending entries that are beyond the stream's last sequence
@@ -6494,12 +6666,19 @@ func (o *consumer) reconcileStateWithStream(streamLastSeq uint64) {
 		}
 	}
 
+	// Remove deferred entries that are beyond the stream's last sequence
+	for seq := range deferred {
+		if seq > streamLastSeq {
+			delete(deferred, seq)
+		}
+	}
+
 	// Update starting sequence and delivery sequence based on pending state
-	if len(o.pending) == 0 {
+	if len(o.pending) == 0 && len(deferred) == 0 {
 		o.sseq = o.asflr + 1
 		o.dseq = o.adflr + 1
 	} else {
-		// Find highest stream sequence in pending
+		// Find highest stream sequence in pending and deferred
 		var maxStreamSeq uint64
 		var maxConsumerSeq uint64
 
@@ -6511,11 +6690,31 @@ func (o *consumer) reconcileStateWithStream(streamLastSeq uint64) {
 				maxConsumerSeq = p.Sequence
 			}
 		}
+		for seq := range deferred {
+			if seq > maxStreamSeq {
+				maxStreamSeq = seq
+			}
+		}
 
 		// Set next sequences based on highest pending
 		o.sseq = maxStreamSeq + 1
-		o.dseq = maxConsumerSeq + 1
+		if len(o.pending) > 0 {
+			o.dseq = maxConsumerSeq + 1
+		} else {
+			o.dseq = o.adflr + 1
+		}
 	}
+
+	// Deferred messages and out of order deliveries need the exact floors.
+	if len(deferred) > 0 || pendingOutOfOrder(o.pending) {
+		state := ConsumerState{Pending: o.pending, Deferred: deferred}
+		flr := newAckIdx(&state).floors(SequencePair{Consumer: o.dseq - 1, Stream: o.sseq - 1})
+		o.adflr, o.asflr = flr.Consumer, flr.Stream
+	}
+	if o.ackLimits != nil {
+		o.setupAckLimitsLocked(deferred)
+	}
+	return deferred
 }
 
 // Will select the starting sequence.
@@ -6780,6 +6979,19 @@ func (o *consumer) purge(sseq uint64, slseq uint64, isWider bool) {
 		o.sseq = sseq
 	}
 
+	// Deferred messages below the purge are gone, as are those a wider purge removed.
+	if o.ackLimits != nil {
+		o.dropDeferredBelowLocked(sseq)
+		if isWider && store != nil {
+			var smv StoreMsg
+			for _, seq := range o.ackLimits.deferredSeqs() {
+				if _, err := store.LoadMsg(seq, &smv); err == errDeletedMsg || err == ErrStoreMsgNotFound {
+					o.dropDeferredLocked(seq)
+				}
+			}
+		}
+	}
+
 	if o.asflr < sseq {
 		o.asflr = sseq - 1
 		// We need to remove those no longer relevant from pending.
@@ -6793,6 +7005,7 @@ func (o *consumer) purge(sseq uint64, slseq uint64, isWider bool) {
 				}
 				delete(o.pending, seq)
 				delete(o.rdc, seq)
+				o.releasePendingLocked(seq, p.Sequence)
 				o.updateAcks(p.Sequence, seq, _EMPTY_)
 				// rdq handled below.
 			} else if isWider && store != nil {
@@ -6808,6 +7021,7 @@ func (o *consumer) purge(sseq uint64, slseq uint64, isWider bool) {
 					}
 					delete(o.pending, seq)
 					delete(o.rdc, seq)
+					o.releasePendingLocked(seq, p.Sequence)
 					o.updateAcks(p.Sequence, seq, _EMPTY_)
 				}
 			}
@@ -6818,6 +7032,11 @@ func (o *consumer) purge(sseq uint64, slseq uint64, isWider bool) {
 	if len(o.pending) == 0 {
 		o.pending, o.rdc = nil, nil
 		o.adflr, o.asflr = o.dseq-1, o.sseq-1
+	}
+	if o.ackLimits != nil {
+		// Deferred messages may remain, use the exact floors.
+		o.adflr, o.asflr = o.ackLimits.floors(o)
+		o.maybeDropAckLimitsLocked()
 	}
 
 	// We need to remove all those being queued for redelivery under o.rdq
@@ -7181,6 +7400,9 @@ func (o *consumer) decStreamPending(sseq uint64, subj string) {
 		delete(o.rdc, sseq)
 		// Pass 0 as the delivered sequence to only remove the redelivered state.
 		o.updateAcks(0, sseq, _EMPTY_)
+	} else if o.ackLimits != nil && o.isLeader() && o.ackLimits.isDeferred(sseq) {
+		// A deferred message was removed before we could deliver it.
+		o.dropDeferredLocked(sseq)
 	}
 
 	o.mu.Unlock()
@@ -7412,8 +7634,11 @@ func (o *consumer) checkStateForInterestStream(ss *StreamState) error {
 				}
 				// If we have pending, we will need to walk through to delivered in case we missed any of those acks as well.
 				if _, ok := state.Pending[seq]; !ok {
-					// The filters are already taken into account,
-					mset.ackMsg(o, seq)
+					// Deferred messages are not delivered yet.
+					if _, deferred := state.Deferred[seq]; !deferred {
+						// The filters are already taken into account,
+						mset.ackMsg(o, seq)
+					}
 				}
 			}
 		} else if err == ErrStoreEOF {
