@@ -14705,3 +14705,85 @@ func testJetStreamConsumerMaxAckPendingPerSubjectTokens(t *testing.T, storage na
 		expectInfo(t, "B", 0, 0, 0)
 	})
 }
+
+// BenchmarkJetStreamConsumerMaxAckPendingPerSubjectTokens compares a plain max ack pending
+// pull consumer with one bounding acks per key with a limit of 1, 4 fetchers, for a number of
+// keys well above what is in flight (little deferring) and well below (constant deferring).
+// Fetch batches never exceed what the keys allow in flight, otherwise a fetch would wait for
+// its batch to fill while holding the acks that would free the keys.
+func BenchmarkJetStreamConsumerMaxAckPendingPerSubjectTokens(b *testing.B) {
+	const fetchers = 4
+	perKey := []MaxAckPendingPerSubjectTokens{{Filter: "operations.*.>", Wildcards: []int{1}, MaxAckPending: 1}}
+	for _, bc := range []struct {
+		name    string
+		keys    int
+		entries []MaxAckPendingPerSubjectTokens
+	}{
+		{"MaxAckPending/keys=1000", 1000, nil},
+		{"PerKey/keys=1000", 1000, perKey},
+		{"MaxAckPending/keys=50", 50, nil},
+		{"PerKey/keys=50", 50, perKey},
+	} {
+		keys := bc.keys
+		batchSize := min(100, keys/fetchers)
+		b.Run(bc.name, func(b *testing.B) {
+			s := RunBasicJetStreamServer(b)
+			defer s.Shutdown()
+			nc, js := jsClientConnect(b, s)
+			defer nc.Close()
+
+			_, err := js.AddStream(&nats.StreamConfig{Name: "TEST", Subjects: []string{"operations.>"}, Storage: nats.MemoryStorage})
+			require_NoError(b, err)
+			for i := 0; i < b.N; i++ {
+				_, err := js.PublishAsync(fmt.Sprintf("operations.%d.op", i%keys), []byte("msg"))
+				require_NoError(b, err)
+				if i%1000 == 999 {
+					<-js.PublishAsyncComplete()
+				}
+			}
+			<-js.PublishAsyncComplete()
+
+			cfg := ConsumerConfig{Durable: "C", AckPolicy: AckExplicit, MaxAckPending: 1000, MaxAckPendingPerSubjectTokens: bc.entries}
+			req, err := json.Marshal(CreateConsumerRequest{Stream: "TEST", Config: cfg, Action: ActionCreate})
+			require_NoError(b, err)
+			rmsg, err := nc.Request(fmt.Sprintf(JSApiDurableCreateT, "TEST", "C"), req, 5*time.Second)
+			require_NoError(b, err)
+			var resp JSApiConsumerCreateResponse
+			require_NoError(b, json.Unmarshal(rmsg.Data, &resp))
+			if resp.Error != nil {
+				b.Fatalf("Unexpected error: %v", resp.Error)
+			}
+
+			var consumed atomic.Int64
+			var wg sync.WaitGroup
+			b.ResetTimer()
+			for i := 0; i < fetchers; i++ {
+				wg.Add(1)
+				go func() {
+					defer wg.Done()
+					fnc, fjs := jsClientConnect(b, s)
+					defer fnc.Close()
+					sub, err := fjs.PullSubscribe(_EMPTY_, "C", nats.Bind("TEST", "C"))
+					if err != nil {
+						b.Errorf("Unexpected error: %v", err)
+						return
+					}
+					for consumed.Load() < int64(b.N) {
+						msgs, err := sub.Fetch(batchSize, nats.MaxWait(500*time.Millisecond))
+						if err != nil && err != nats.ErrTimeout {
+							b.Errorf("Unexpected error: %v", err)
+							return
+						}
+						for _, m := range msgs {
+							if err := m.Ack(); err == nil {
+								consumed.Add(1)
+							}
+						}
+					}
+				}()
+			}
+			wg.Wait()
+			b.StopTimer()
+		})
+	}
+}
