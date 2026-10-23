@@ -16898,7 +16898,7 @@ func TestFileStoreCompactionPreservesRedelivery(t *testing.T) {
 		}
 		o.addToRedeliverQueue(seq)
 		o.mu.Lock()
-		pmsg, dc, err := o.getNextMsg()
+		pmsg, dc, _, err := o.getNextMsg()
 		_, pending := o.pending[seq]
 		_, retry := o.rdc[seq]
 		floor := o.asflr
